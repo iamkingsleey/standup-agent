@@ -1,0 +1,22 @@
+# Environment variables (contains API keys)
+.env
+
+# Google Calendar credentials
+credentials.json
+token.pickle
+
+# Python virtual environment
+venv/
+__pycache__/
+
+# Backup files
+bot_old.py
+bot_v2_backup.py
+bot_v3_backup.py
+
+# Mac files
+.DS_Store
+.env.save
+.env
+*.env*
+.env
