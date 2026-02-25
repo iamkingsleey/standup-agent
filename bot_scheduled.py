@@ -13,6 +13,8 @@ import schedule
 import time
 import threading
 import re
+import json
+from collections import defaultdict
 
 load_dotenv()
 
@@ -21,6 +23,12 @@ anthropic = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 YOUR_USER_ID = None
+YOUR_SLACK_USER_ID = None
+
+# Track messages that mention you and haven't been responded to
+pending_mentions = {}
+# Keywords to skip auto-response for sensitive topics
+SENSITIVE_KEYWORDS = ['personal', 'private', 'confidential', 'sensitive', '1:1', 'one-on-one']
 
 def get_calendar_service():
     creds = None
@@ -140,6 +148,92 @@ def delete_calendar_event(event_title, days_offset=0):
     except Exception as e:
         return f"Could not delete event: {str(e)}"
 
+def check_user_active():
+    """Check if Kingsley is currently active on Slack"""
+    try:
+        if YOUR_SLACK_USER_ID:
+            response = app.client.users_getPresence(user=YOUR_SLACK_USER_ID)
+            return response['presence'] == 'active'
+    except Exception as e:
+        print(f"Error checking presence: {e}")
+    return False
+
+def search_slack_history(query, channel_id):
+    """Search Slack message history for relevant information"""
+    try:
+        result = app.client.search_messages(query=query, count=5)
+        if result['messages']['matches']:
+            return result['messages']['matches'][:3]
+    except Exception as e:
+        print(f"Error searching history: {e}")
+    return []
+
+def auto_respond_to_mention(channel, thread_ts, original_message):
+    """Auto-respond when Kingsley doesn't reply within 5 minutes"""
+    global YOUR_SLACK_USER_ID
+    
+    # Wait 5 minutes
+    time.sleep(300)
+    
+    # Check if still pending (Kingsley hasn't responded)
+    key = f"{channel}:{thread_ts}"
+    if key not in pending_mentions:
+        return
+    
+    # Check if user is now active
+    if check_user_active():
+        print(f"User is active, skipping auto-response for {key}")
+        del pending_mentions[key]
+        return
+    
+    # Check for sensitive keywords
+    message_lower = original_message.lower()
+    if any(keyword in message_lower for keyword in SENSITIVE_KEYWORDS):
+        print(f"Sensitive content detected, skipping auto-response for {key}")
+        del pending_mentions[key]
+        return
+    
+    try:
+        search_results = search_slack_history(original_message[:100], channel)
+        
+        context = f"Someone asked: '{original_message}'\n"
+        if search_results:
+            context += "\nRelevant past messages:\n"
+            for msg in search_results:
+                context += f"- {msg.get('text', '')[:200]}\n"
+        
+        ai_prompt = f"""{context}
+
+You are Kingsley's AI assistant. Kingsley hasn't responded yet. Provide a helpful response that:
+1. Acknowledges you're the assistant
+2. Provides useful information if possible
+3. Asks clarifying questions if needed
+4. Mentions Kingsley will follow up
+
+Keep it brief and professional."""
+        
+        response = anthropic.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=500,
+            messages=[{"role": "user", "content": ai_prompt}]
+        )
+        
+        reply = f"👋 Hi! I'm Kingsley's AI assistant. He hasn't responded yet, but let me help:\n\n{response.content[0].text}\n\n_Kingsley will follow up when he's available._"
+        
+        app.client.chat_postMessage(
+            channel=channel,
+            thread_ts=thread_ts,
+            text=reply
+        )
+        
+        print(f"Auto-responded to mention in {channel}")
+        
+    except Exception as e:
+        print(f"Error in auto-response: {e}")
+    
+    if key in pending_mentions:
+        del pending_mentions[key]
+
 def send_daily_standup():
     global YOUR_USER_ID
     if YOUR_USER_ID:
@@ -158,19 +252,29 @@ def run_scheduler():
         schedule.run_pending()
         time.sleep(60)
 
-@app.message("")
-def handle_message(message, say):
-    global YOUR_USER_ID
-    if not YOUR_USER_ID:
-        YOUR_USER_ID = message['user']
-        print(f"User ID saved: {YOUR_USER_ID}")
-    
-    user_message = message['text']
+
+# ============================================================
+# HANDLE DM MESSAGES
+# ============================================================
+def process_direct_message(event, say):
+    """Process a direct message from the user"""
+    global YOUR_USER_ID, YOUR_SLACK_USER_ID
+
+    user = event.get('user')
+    user_message = event.get('text', '')
     user_message_lower = user_message.lower()
-    
+
+    # Save user ID on first DM
+    if not YOUR_USER_ID:
+        YOUR_USER_ID = user
+        YOUR_SLACK_USER_ID = user
+        print(f"User ID saved from DM: {YOUR_USER_ID}")
+
+    print(f"Processing DM: {user_message[:50]}...")
+
     calendar_info = ""
     days_offset = None
-    
+
     # Check for delete requests
     if ("delete" in user_message_lower or "cancel" in user_message_lower or "remove" in user_message_lower) and ("meeting" in user_message_lower or "event" in user_message_lower or "call" in user_message_lower):
         deletion_prompt = f"""Extract the event deletion details from this message: "{user_message}"
@@ -180,85 +284,82 @@ Return ONLY a JSON object with these fields:
 - date_context: "today", "tomorrow", or null for today
 
 Example: "Delete the Product Sync meeting tomorrow" -> {{"event_title": "Product Sync", "date_context": "tomorrow"}}"""
-        
+
         deletion_response = anthropic.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=500,
             messages=[{"role": "user", "content": deletion_prompt}]
         )
-        
+
         try:
-            import json
             extracted_text = deletion_response.content[0].text.strip()
             extracted_text = extracted_text.replace('```json', '').replace('```', '').strip()
             delete_details = json.loads(extracted_text)
-            
+
             if delete_details.get('event_title'):
                 days = 1 if delete_details.get('date_context') == 'tomorrow' else 0
                 result = delete_calendar_event(delete_details['event_title'], days)
                 say(result)
                 return
             else:
-                say("Please specify which event you want to delete. Example: 'Delete the Team Sync meeting tomorrow'")
+                say("Please specify which event you want to delete.")
                 return
         except Exception as e:
             say(f"I had trouble understanding the deletion request. Error: {str(e)}")
             return
-    
+
     # Check for scheduling requests
     if "schedule" in user_message_lower and ("meeting" in user_message_lower or "call" in user_message_lower or "event" in user_message_lower):
         extraction_prompt = f"""Extract the event details from this message: "{user_message}"
 
 Return ONLY a JSON object with these fields:
 - title: the event name/summary
-- date: YYYY-MM-DD format (if 'tomorrow' use tomorrow's date, if 'today' use today's date)
+- date: YYYY-MM-DD format
 - time: HH:MM format in 24-hour time
-- duration: number of minutes (default 60 if not specified)
-- attendees: array of email addresses (empty array if none mentioned)
+- duration: number of minutes (default 60)
+- attendees: array of email addresses
 
-If any information is missing, set it to null or empty array for attendees.
 Today's date is {datetime.datetime.now().strftime('%Y-%m-%d')}"""
-        
+
         extraction_response = anthropic.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=500,
             messages=[{"role": "user", "content": extraction_prompt}]
         )
-        
+
         try:
-            import json
             extracted_text = extraction_response.content[0].text.strip()
             extracted_text = extracted_text.replace('```json', '').replace('```', '').strip()
             event_details = json.loads(extracted_text)
-            
+
             if event_details.get('title') and event_details.get('date') and event_details.get('time'):
                 event_datetime = datetime.datetime.strptime(
-                    f"{event_details['date']} {event_details['time']}", 
+                    f"{event_details['date']} {event_details['time']}",
                     "%Y-%m-%d %H:%M"
                 )
-                
+
                 duration = event_details.get('duration', 60)
                 attendees = event_details.get('attendees', [])
-                
+
                 result = create_calendar_event(event_details['title'], event_datetime, duration, attendees if attendees else None)
                 say(result)
                 return
             else:
-                say("I couldn't extract all the event details. Please specify the event title, date, and time.")
+                say("I couldn't extract all the event details.")
                 return
         except Exception as e:
             say(f"I had trouble understanding the scheduling request. Error: {str(e)}")
             return
-    
+
     # Regular calendar queries
     if "tomorrow" in user_message_lower:
         days_offset = 1
     elif "today" in user_message_lower or "calendar" in user_message_lower or "meeting" in user_message_lower:
         days_offset = 0
-    
+
     if days_offset is not None:
         calendar_info = f"\n\nCalendar information:\n{get_events_for_date(days_offset)}"
-    
+
     response = anthropic.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=1000,
@@ -266,10 +367,74 @@ Today's date is {datetime.datetime.now().strftime('%Y-%m-%d')}"""
     )
     say(response.content[0].text)
 
+
+# ============================================================
+# MAIN EVENT HANDLER - Routes DMs and channel messages
+# ============================================================
+@app.event("message")
+def handle_message_event(event, say):
+    global YOUR_SLACK_USER_ID, YOUR_USER_ID
+    
+    # Skip bot messages
+    if event.get('subtype') == 'bot_message':
+        return
+    
+    # Skip message_changed, message_deleted, etc.
+    if event.get('subtype') is not None:
+        return
+
+    # ---- DM: route to direct message handler ----
+    if event.get('channel_type') == 'im':
+        process_direct_message(event, say)
+        return
+
+    # ---- CHANNEL MESSAGE: monitor for mentions ----
+    channel = event.get('channel')
+    text = event.get('text', '')
+    user = event.get('user')
+    ts = event['ts']
+    thread_ts = event.get('thread_ts', ts)
+    
+    # Save user ID on first message
+    if not YOUR_SLACK_USER_ID and not YOUR_USER_ID:
+        YOUR_SLACK_USER_ID = user
+        YOUR_USER_ID = user
+        print(f"User ID saved from channel message: {user}")
+        return
+    
+    # Check if this message mentions Kingsley
+    if YOUR_SLACK_USER_ID and f"<@{YOUR_SLACK_USER_ID}>" in text:
+        if user != YOUR_SLACK_USER_ID:
+            key = f"{channel}:{thread_ts}"
+            
+            pending_mentions[key] = {
+                'channel': channel,
+                'thread_ts': thread_ts,
+                'message': text,
+                'timestamp': time.time()
+            }
+            
+            threading.Thread(
+                target=auto_respond_to_mention,
+                args=(channel, thread_ts, text),
+                daemon=True
+            ).start()
+            
+            print(f"Tracking mention in {channel}, will auto-respond in 5 min if no reply")
+    
+    # Check if Kingsley replied to a pending mention
+    if YOUR_SLACK_USER_ID and user == YOUR_SLACK_USER_ID:
+        key = f"{channel}:{thread_ts}"
+        if key in pending_mentions:
+            print(f"Kingsley responded, canceling auto-response for {key}")
+            del pending_mentions[key]
+
+
 if __name__ == "__main__":
     print("Bot is running!")
     print("Daily standup scheduled for 9:00 AM")
-    print("Calendar features: read, create, delete events with attendees!")
+    print("Auto-response monitoring enabled - will respond if you don't reply in 5 min")
+    print("Calendar features: read, create, delete events with attendees")
     scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
     scheduler_thread.start()
     SocketModeHandler(app, os.environ.get("SLACK_APP_TOKEN")).start()
