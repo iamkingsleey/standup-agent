@@ -33,6 +33,7 @@ Author: Kingsley Mkpandiok
 """
 
 import os
+import re
 import sqlite3
 import secrets
 import datetime
@@ -41,6 +42,7 @@ import schedule
 import time
 import threading
 import json
+import pytz
 
 import requests as http_requests
 from flask import Flask, request, jsonify, redirect as flask_redirect
@@ -128,6 +130,48 @@ processed_event_ids: set = set()
 # to avoid the bot inadvertently weighing in on sensitive conversations.
 SENSITIVE_KEYWORDS = ['personal', 'private', 'confidential', 'sensitive', '1:1', 'one-on-one']
 
+# Per-user DM conversation history for multi-turn context-aware replies.
+# Key: "{team_id}:{user_id}", Value: list of {"role": ..., "content": ...}
+# Capped at 10 messages per user to stay within token limits.
+conversation_history: dict = {}
+
+# Tracks reply counts per thread for auto-summarization.
+# Key: "{team_id}:{channel}:{thread_ts}", Value: int reply count
+thread_reply_counts: dict = {}
+
+# ---------------------------------------------------------------------------
+# Timezone Intelligence
+# ---------------------------------------------------------------------------
+
+# Maps common timezone abbreviations to IANA timezone names for pytz
+TIMEZONE_ABBREVIATIONS = {
+    'PST': 'America/Los_Angeles',  'PDT': 'America/Los_Angeles',
+    'MST': 'America/Denver',       'MDT': 'America/Denver',
+    'CST': 'America/Chicago',      'CDT': 'America/Chicago',
+    'EST': 'America/New_York',     'EDT': 'America/New_York',
+    'GMT': 'UTC',                  'UTC': 'UTC',
+    'BST': 'Europe/London',
+    'CET': 'Europe/Paris',         'CEST': 'Europe/Paris',
+    'IST': 'Asia/Kolkata',
+    'JST': 'Asia/Tokyo',           'KST': 'Asia/Seoul',
+    'AEST': 'Australia/Sydney',    'AEDT': 'Australia/Sydney',
+    'WAT': 'Africa/Lagos',         'EAT': 'Africa/Nairobi',
+    'CAT': 'Africa/Harare',        'SAST': 'Africa/Johannesburg',
+}
+
+# Regex to detect time+timezone patterns like "3 PM PST", "14:30 UTC", "9am EST"
+TIME_MENTION_PATTERN = re.compile(
+    r'\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s+'
+    r'(PST|PDT|MST|MDT|CST|CDT|EST|EDT|GMT|UTC|BST|CET|CEST|IST|JST|KST|AEST|AEDT|WAT|EAT|CAT|SAST)\b',
+    re.IGNORECASE
+)
+
+# Regex to detect channel summary requests in DMs like "summarize #dev-team"
+CHANNEL_SUMMARY_PATTERN = re.compile(
+    r'(?:summarize|summary|what happened|what was discussed|what did they|recap|what\'s going on)\s+(?:in\s+)?#?([\w-]+)',
+    re.IGNORECASE
+)
+
 
 # ---------------------------------------------------------------------------
 # Database — Per-Workspace Owner Storage
@@ -173,6 +217,15 @@ def init_db() -> None:
             team_id    TEXT PRIMARY KEY,
             token_data BLOB NOT NULL,
             updated_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_timezones (
+            team_id    TEXT NOT NULL,
+            user_id    TEXT NOT NULL,
+            timezone   TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (team_id, user_id)
         )
     """)
     conn.commit()
@@ -312,6 +365,45 @@ def get_all_workspaces() -> list[tuple]:
     rows = conn.execute("SELECT team_id, user_id FROM workspace_owners").fetchall()
     conn.close()
     return rows
+
+
+def get_user_timezone(team_id: str, user_id: str) -> str:
+    """
+    Get stored timezone for a user, defaulting to Africa/Lagos.
+
+    Args:
+        team_id (str): Slack workspace ID.
+        user_id (str): Slack user ID.
+
+    Returns:
+        str: IANA timezone string (e.g. 'America/New_York').
+    """
+    conn = sqlite3.connect("data/bot.db")
+    row = conn.execute(
+        "SELECT timezone FROM user_timezones WHERE team_id = ? AND user_id = ?",
+        (team_id, user_id)
+    ).fetchone()
+    conn.close()
+    return row[0] if row else 'Africa/Lagos'
+
+
+def set_user_timezone(team_id: str, user_id: str, timezone: str) -> None:
+    """
+    Store or update a user's timezone preference.
+
+    Args:
+        team_id (str): Slack workspace ID.
+        user_id (str): Slack user ID.
+        timezone (str): IANA timezone string (e.g. 'America/New_York').
+    """
+    conn = sqlite3.connect("data/bot.db")
+    conn.execute(
+        """INSERT OR REPLACE INTO user_timezones (team_id, user_id, timezone, updated_at)
+           VALUES (?, ?, ?, ?)""",
+        (team_id, user_id, timezone, datetime.datetime.utcnow().isoformat())
+    )
+    conn.commit()
+    conn.close()
 
 
 def store_google_token(team_id: str, creds) -> None:
@@ -611,6 +703,286 @@ def delete_calendar_event(team_id: str, event_title: str, days_offset: int = 0) 
 
 
 # ---------------------------------------------------------------------------
+# Conversation History (Context-Aware Replies)
+# ---------------------------------------------------------------------------
+
+def get_user_history(team_id: str, user_id: str) -> list:
+    """
+    Retrieve the recent DM conversation history for a user.
+
+    Used to provide multi-turn context to the AI so it remembers what was
+    discussed earlier in the same conversation session.
+
+    Args:
+        team_id (str): Slack workspace ID.
+        user_id (str): Slack user ID.
+
+    Returns:
+        list: List of {"role": "user"|"assistant", "content": str} dicts.
+    """
+    return conversation_history.get(f"{team_id}:{user_id}", [])
+
+
+def update_user_history(team_id: str, user_id: str, role: str, content: str) -> None:
+    """
+    Append a message to a user's conversation history, capping at 10 entries.
+
+    Args:
+        team_id (str): Slack workspace ID.
+        user_id (str): Slack user ID.
+        role (str): 'user' or 'assistant'.
+        content (str): The message text.
+    """
+    key = f"{team_id}:{user_id}"
+    if key not in conversation_history:
+        conversation_history[key] = []
+    conversation_history[key].append({"role": role, "content": content})
+    # Keep only the last 10 messages to stay within token limits
+    if len(conversation_history[key]) > 10:
+        conversation_history[key] = conversation_history[key][-10:]
+
+
+# ---------------------------------------------------------------------------
+# Channel & Thread Summarization
+# ---------------------------------------------------------------------------
+
+def get_channel_id(channel_name: str, bot_token: str) -> str | None:
+    """
+    Look up a Slack channel ID by name.
+
+    Searches both public and private channels the bot has access to.
+
+    Args:
+        channel_name (str): Channel name with or without the # prefix.
+        bot_token (str): Bot token for the workspace to search in.
+
+    Returns:
+        str | None: The Slack channel ID (e.g. 'C01234567'), or None if not found.
+    """
+    channel_name = channel_name.lstrip('#').lower()
+    client = WebClient(token=bot_token)
+    try:
+        for channel_type in ["public_channel", "private_channel"]:
+            cursor = None
+            while True:
+                result = client.conversations_list(
+                    types=channel_type,
+                    limit=200,
+                    cursor=cursor
+                )
+                for channel in result.get('channels', []):
+                    if channel['name'].lower() == channel_name:
+                        return channel['id']
+                cursor = result.get('response_metadata', {}).get('next_cursor')
+                if not cursor:
+                    break
+    except Exception as e:
+        print(f"Error finding channel '{channel_name}': {e}")
+    return None
+
+
+def resolve_user_names(user_ids: list, bot_token: str) -> dict:
+    """
+    Resolve a list of Slack user IDs to display names.
+
+    Args:
+        user_ids (list): List of Slack user ID strings.
+        bot_token (str): Bot token for the workspace.
+
+    Returns:
+        dict: Maps user_id -> display name string.
+    """
+    client = WebClient(token=bot_token)
+    names = {}
+    for uid in set(user_ids):
+        try:
+            info = client.users_info(user=uid)
+            profile = info['user']['profile']
+            names[uid] = profile.get('display_name') or profile.get('real_name', uid)
+        except Exception:
+            names[uid] = uid
+    return names
+
+
+def summarize_channel_history(channel_id: str, bot_token: str, hours: int = 24) -> str:
+    """
+    Fetch and summarise recent messages from a Slack channel.
+
+    Retrieves messages from the last `hours` hours, resolves user display
+    names, then asks Claude to produce a concise summary with key topics,
+    decisions, and action items.
+
+    Args:
+        channel_id (str): Slack channel ID.
+        bot_token (str): Bot token for the workspace.
+        hours (int): How many hours back to look. Defaults to 24.
+
+    Returns:
+        str: AI-generated summary, or an error/empty message.
+    """
+    client = WebClient(token=bot_token)
+    try:
+        oldest = str((datetime.datetime.utcnow() - datetime.timedelta(hours=hours)).timestamp())
+        result = client.conversations_history(channel=channel_id, oldest=oldest, limit=200)
+        messages = [m for m in result.get('messages', []) if m.get('text') and not m.get('bot_id')]
+
+        if not messages:
+            return "No messages found in that channel for the past 24 hours."
+
+        # Resolve user IDs to names for a more readable summary
+        user_ids = [m.get('user') for m in messages if m.get('user')]
+        names = resolve_user_names(user_ids, bot_token)
+
+        formatted = "\n".join([
+            f"{names.get(m.get('user', ''), 'Unknown')}: {m.get('text', '')}"
+            for m in reversed(messages)
+        ])
+
+        response = anthropic.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=800,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Summarize this Slack channel conversation from the past 24 hours.\n"
+                    f"Structure your summary as:\n"
+                    f"📌 **Key Topics**: (bullet list)\n"
+                    f"✅ **Decisions Made**: (bullet list, or 'None' if none)\n"
+                    f"📋 **Action Items**: (bullet list, or 'None' if none)\n"
+                    f"❓ **Open Questions**: (bullet list, or 'None' if none)\n\n"
+                    f"Conversation:\n{formatted}"
+                )
+            }]
+        )
+        return response.content[0].text
+
+    except Exception as e:
+        return f"Could not summarize channel: {str(e)}"
+
+
+def summarize_thread(channel_id: str, thread_ts: str, bot_token: str) -> str:
+    """
+    Fetch and summarise all messages in a Slack thread.
+
+    Retrieves all replies, resolves user names, then asks Claude to extract
+    decisions, action items, and open questions from the thread.
+
+    Args:
+        channel_id (str): Slack channel ID containing the thread.
+        thread_ts (str): Timestamp of the thread root message.
+        bot_token (str): Bot token for the workspace.
+
+    Returns:
+        str: AI-generated thread summary with structured output.
+    """
+    client = WebClient(token=bot_token)
+    try:
+        result = client.conversations_replies(channel=channel_id, ts=thread_ts)
+        messages = [m for m in result.get('messages', []) if m.get('text')]
+
+        if len(messages) < 2:
+            return "Not enough messages in this thread to summarize yet."
+
+        user_ids = [m.get('user') for m in messages if m.get('user')]
+        names = resolve_user_names(user_ids, bot_token)
+
+        formatted = "\n".join([
+            f"{names.get(m.get('user', ''), 'Bot')}: {m.get('text', '')}"
+            for m in messages
+        ])
+
+        response = anthropic.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=600,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Summarize this Slack thread ({len(messages)} messages).\n"
+                    f"Structure your output as:\n"
+                    f"📌 **Summary**: (2-3 sentence overview)\n"
+                    f"✅ **Decisions**: (bullet list, or 'None')\n"
+                    f"📋 **Action Items**: (bullet list with owners if mentioned, or 'None')\n"
+                    f"❓ **Open Questions**: (bullet list, or 'None')\n\n"
+                    f"Thread:\n{formatted}"
+                )
+            }]
+        )
+        return response.content[0].text
+
+    except Exception as e:
+        return f"Could not summarize thread: {str(e)}"
+
+
+# ---------------------------------------------------------------------------
+# Timezone Intelligence
+# ---------------------------------------------------------------------------
+
+def detect_and_convert_times(text: str, user_timezone: str) -> str | None:
+    """
+    Detect time+timezone mentions in text and convert them to the user's timezone.
+
+    Also calculates overlap windows and flags times outside standard business hours.
+
+    Args:
+        text (str): The message text to scan for time mentions.
+        user_timezone (str): IANA timezone for the user (e.g. 'Africa/Lagos').
+
+    Returns:
+        str | None: A formatted timezone conversion block, or None if no times found.
+    """
+    matches = TIME_MENTION_PATTERN.findall(text)
+    if not matches:
+        return None
+
+    conversions = []
+    user_tz = pytz.timezone(user_timezone)
+
+    for hour_str, minute_str, ampm, tz_abbr in matches:
+        try:
+            hour = int(hour_str)
+            minute = int(minute_str) if minute_str else 0
+
+            if ampm.lower() == 'pm' and hour != 12:
+                hour += 12
+            elif ampm.lower() == 'am' and hour == 12:
+                hour = 0
+
+            source_tz_name = TIMEZONE_ABBREVIATIONS.get(tz_abbr.upper(), 'UTC')
+            source_tz = pytz.timezone(source_tz_name)
+
+            # Build a timezone-aware datetime for today at the given time
+            today = datetime.datetime.now(source_tz)
+            source_time = source_tz.localize(
+                datetime.datetime(today.year, today.month, today.day, hour, minute)
+            )
+
+            user_time = source_time.astimezone(user_tz)
+            utc_time = source_time.astimezone(pytz.utc)
+
+            # Flag times outside 9am-6pm in either timezone
+            flags = []
+            if not (9 <= source_time.hour < 18):
+                flags.append(f"⚠️ outside business hours in {tz_abbr}")
+            if not (9 <= user_time.hour < 18):
+                flags.append("⚠️ outside your business hours")
+
+            flag_str = f"  {', '.join(flags)}" if flags else ""
+
+            original = f"{hour_str}:{minute_str or '00'} {ampm.upper()} {tz_abbr.upper()}"
+            conversions.append(
+                f"• *{original}* → *{user_time.strftime('%I:%M %p')} your time* "
+                f"({utc_time.strftime('%H:%M UTC')}){flag_str}"
+            )
+
+        except Exception as e:
+            print(f"Timezone conversion error: {e}")
+
+    if conversions:
+        return "🕒 *Time Conversion:*\n" + "\n".join(conversions)
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Slack Utility Helpers
 # ---------------------------------------------------------------------------
 
@@ -870,6 +1242,46 @@ def process_direct_message(event: dict, say) -> None:
 
     print(f"Processing DM: {user_message[:50]}...")
 
+    # --- Timezone setting: "my timezone is EST" / "set timezone to WAT" ---
+    tz_set_match = re.search(
+        r'(?:my timezone is|set (?:my )?timezone to|i(?:\'m| am) in)\s+([A-Za-z/_]+)',
+        user_message, re.IGNORECASE
+    )
+    if tz_set_match:
+        tz_input = tz_set_match.group(1).upper()
+        tz_name = TIMEZONE_ABBREVIATIONS.get(tz_input)
+        if not tz_name:
+            # Try as full IANA name
+            try:
+                pytz.timezone(tz_set_match.group(1))
+                tz_name = tz_set_match.group(1)
+            except Exception:
+                tz_name = None
+        if tz_name:
+            set_user_timezone(team_id, user, tz_name)
+            say(f"✅ Got it! I've set your timezone to *{tz_name}*. I'll convert all meeting times for you.")
+        else:
+            say(f"I don't recognise that timezone. Try something like `WAT`, `EST`, `PST`, or a full IANA name like `Africa/Lagos`.")
+        return
+
+    # --- Channel summary: "summarize #dev-team" / "what happened in #general" ---
+    channel_match = CHANNEL_SUMMARY_PATTERN.search(user_message)
+    if channel_match:
+        channel_name = channel_match.group(1)
+        say(f"Give me a moment to summarize *#{channel_name}*... 🔍")
+        bot_token = get_installation_token(team_id)
+        channel_id = get_channel_id(channel_name, bot_token)
+        if channel_id:
+            summary = summarize_channel_history(channel_id, bot_token)
+            say(f"📋 *Summary of #{channel_name} (last 24 hours):*\n\n{summary}")
+        else:
+            say(
+                f"I couldn't find a channel named *#{channel_name}*.\n"
+                f"Make sure:\n• The channel name is spelled correctly\n"
+                f"• The bot has been added to that channel"
+            )
+        return
+
     calendar_info = ""
     days_offset = None
 
@@ -969,12 +1381,35 @@ Today's date is {datetime.datetime.now().strftime('%Y-%m-%d')}"""
     if days_offset is not None:
         calendar_info = f"\n\nCalendar information:\n{get_events_for_date(team_id, days_offset)}"
 
+    # Build messages with conversation history for multi-turn context
+    history = get_user_history(team_id, user)
+    full_message = user_message + calendar_info
+    messages = history + [{"role": "user", "content": full_message}]
+
     response = anthropic.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=1000,
-        messages=[{"role": "user", "content": user_message + calendar_info}]
+        system=(
+            "You are a smart personal assistant in Slack. You help with calendar management, "
+            "scheduling, answering questions, and workspace productivity. Be concise and friendly. "
+            "Remember context from earlier in the conversation."
+        ),
+        messages=messages
     )
-    say(response.content[0].text)
+
+    reply = response.content[0].text
+
+    # Append timezone conversion if message contains time+timezone mentions
+    user_tz = get_user_timezone(team_id, user)
+    tz_conversion = detect_and_convert_times(user_message, user_tz)
+    if tz_conversion:
+        reply = f"{reply}\n\n{tz_conversion}"
+
+    # Store in conversation history for future context
+    update_user_history(team_id, user, "user", user_message)
+    update_user_history(team_id, user, "assistant", reply)
+
+    say(reply)
 
 
 # ---------------------------------------------------------------------------
@@ -1139,6 +1574,89 @@ def handle_message_event(event: dict, say) -> None:
             print(f"Owner responded, canceling auto-response for {key}")
             del pending_mentions[key]
 
+    # --- Thread auto-summarization at 10+ replies ---
+    # Track reply counts in memory; when a thread hits 10 messages auto-post a summary
+    if thread_ts != ts:  # This message is a reply (not the root)
+        count_key = f"{team_id}:{channel}:{thread_ts}"
+        thread_reply_counts[count_key] = thread_reply_counts.get(count_key, 0) + 1
+
+        if thread_reply_counts[count_key] == 10:
+            bot_token = get_installation_token(team_id)
+            if bot_token:
+                def post_thread_summary(ch=channel, ts=thread_ts, tk=bot_token):
+                    summary = summarize_thread(ch, ts, tk)
+                    client = WebClient(token=tk)
+                    client.chat_postMessage(
+                        channel=ch,
+                        thread_ts=ts,
+                        text=f"🤖 *Auto-summary (10 messages reached):*\n\n{summary}"
+                    )
+                threading.Thread(target=post_thread_summary, daemon=True).start()
+                print(f"Auto-summarizing thread {thread_ts} in {channel} (10 replies reached)")
+
+
+# ---------------------------------------------------------------------------
+# Slash Command Handler
+# ---------------------------------------------------------------------------
+
+@app.command("/summarize")
+def handle_summarize_command(ack, command, say, client) -> None:
+    """
+    Handle the /summarize slash command.
+
+    When used inside a thread: summarizes that specific thread.
+    When used in a channel (not a thread): summarizes the last 24 hours
+    of that channel's conversation.
+
+    Usage:
+      /summarize              — summarize current thread or channel
+      /summarize #other-channel — summarize a specific channel
+
+    Args:
+        ack: Slack's acknowledgement function (must be called within 3 seconds).
+        command (dict): The slash command payload from Slack.
+        say (callable): Function to post a message in the same channel/thread.
+        client: Slack WebClient scoped to this workspace.
+    """
+    ack()  # Acknowledge immediately so Slack doesn't time out
+
+    channel_id = command['channel_id']
+    team_id = command['team_id']
+    thread_ts = command.get('thread_ts')
+    text = command.get('text', '').strip()
+
+    # Check if user specified a different channel: /summarize #channel-name
+    target_channel_id = channel_id
+    target_channel_name = None
+
+    channel_mention = re.search(r'#?([\w-]+)', text)
+    if channel_mention and text:
+        target_channel_name = channel_mention.group(1)
+        bot_token = get_installation_token(team_id)
+        found_id = get_channel_id(target_channel_name, bot_token)
+        if found_id:
+            target_channel_id = found_id
+        else:
+            say(f"❌ Couldn't find channel *#{target_channel_name}*.")
+            return
+
+    bot_token = get_installation_token(team_id)
+    if not bot_token:
+        say("❌ Bot not properly installed. Please reinstall via /slack/install.")
+        return
+
+    if thread_ts and not target_channel_name:
+        # Summarize the current thread
+        say("🔍 Summarizing this thread...", thread_ts=thread_ts)
+        summary = summarize_thread(channel_id, thread_ts, bot_token)
+        say(f"📋 *Thread Summary:*\n\n{summary}", thread_ts=thread_ts)
+    else:
+        # Summarize the channel
+        label = f"#{target_channel_name}" if target_channel_name else "this channel"
+        say(f"🔍 Summarizing *{label}* (last 24 hours)...")
+        summary = summarize_channel_history(target_channel_id, bot_token)
+        say(f"📋 *Summary of {label}:*\n\n{summary}")
+
 
 # ---------------------------------------------------------------------------
 # Flask Routes
@@ -1164,6 +1682,9 @@ def install():
         "channels:history",
         "channels:read",
         "chat:write",
+        "commands",
+        "groups:history",
+        "groups:read",
         "im:history",
         "im:write",
         "users:read",
@@ -1328,18 +1849,6 @@ def google_auth():
     slack_redirect = os.environ.get("SLACK_REDIRECT_URI", "")
     base_url = slack_redirect.rsplit("/slack/oauth_redirect", 1)[0]
     redirect_uri = f"{base_url}/auth/google/callback"
-    print(f"Google OAuth redirect_uri: {redirect_uri}")
-
-    # Debug: log which client ID is being used
-    try:
-        import json as _json
-        with open(creds_path) as _f:
-            _creds = _json.load(_f)
-        _client_id = list(_creds.values())[0].get("client_id", "unknown")
-        print(f"Google OAuth client_id: {_client_id}")
-    except Exception:
-        pass
-
     flow = Flow.from_client_secrets_file(
         creds_path,
         scopes=SCOPES,
