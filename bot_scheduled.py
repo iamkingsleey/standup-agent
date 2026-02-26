@@ -140,37 +140,244 @@ conversation_history: dict = {}
 thread_reply_counts: dict = {}
 
 # ---------------------------------------------------------------------------
-# Timezone Intelligence
+# Jira Configuration (loaded once at startup from environment variables)
 # ---------------------------------------------------------------------------
 
-# Maps common timezone abbreviations to IANA timezone names for pytz
-TIMEZONE_ABBREVIATIONS = {
-    'PST': 'America/Los_Angeles',  'PDT': 'America/Los_Angeles',
-    'MST': 'America/Denver',       'MDT': 'America/Denver',
-    'CST': 'America/Chicago',      'CDT': 'America/Chicago',
-    'EST': 'America/New_York',     'EDT': 'America/New_York',
-    'GMT': 'UTC',                  'UTC': 'UTC',
-    'BST': 'Europe/London',
-    'CET': 'Europe/Paris',         'CEST': 'Europe/Paris',
-    'IST': 'Asia/Kolkata',
-    'JST': 'Asia/Tokyo',           'KST': 'Asia/Seoul',
-    'AEST': 'Australia/Sydney',    'AEDT': 'Australia/Sydney',
-    'WAT': 'Africa/Lagos',         'EAT': 'Africa/Nairobi',
-    'CAT': 'Africa/Harare',        'SAST': 'Africa/Johannesburg',
-}
+JIRA_BASE_URL  = os.environ.get("JIRA_BASE_URL", "").rstrip("/")
+JIRA_EMAIL     = os.environ.get("JIRA_EMAIL", "")
+JIRA_API_TOKEN = os.environ.get("JIRA_API_TOKEN", "")
 
-# Regex to detect time+timezone patterns like "3 PM PST", "14:30 UTC", "9am EST"
-TIME_MENTION_PATTERN = re.compile(
-    r'\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s+'
-    r'(PST|PDT|MST|MDT|CST|CDT|EST|EDT|GMT|UTC|BST|CET|CEST|IST|JST|KST|AEST|AEDT|WAT|EAT|CAT|SAST)\b',
-    re.IGNORECASE
-)
 
-# Regex to detect channel summary requests in DMs like "summarize #dev-team"
-CHANNEL_SUMMARY_PATTERN = re.compile(
-    r'(?:summarize|summary|what happened|what was discussed|what did they|recap|what\'s going on)\s+(?:in\s+)?#?([\w-]+)',
-    re.IGNORECASE
-)
+def jira_available() -> bool:
+    """Return True if all three Jira env vars are set."""
+    return bool(JIRA_BASE_URL and JIRA_EMAIL and JIRA_API_TOKEN)
+
+
+def jira_headers() -> dict:
+    """Build the Basic-Auth + JSON headers required by Jira Cloud's REST API."""
+    import base64
+    token = base64.b64encode(f"{JIRA_EMAIL}:{JIRA_API_TOKEN}".encode()).decode()
+    return {
+        "Authorization": f"Basic {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Jira Integration — Core Functions
+# ---------------------------------------------------------------------------
+
+def get_my_jira_issues(assignee_email: str | None = None) -> str:
+    """
+    Fetch open Jira issues assigned to a user and return a formatted Slack string.
+
+    If assignee_email is provided, filters by that address. Otherwise falls back
+    to the service-account user (currentUser()) set in JIRA_EMAIL.
+    """
+    if not jira_available():
+        return (
+            "⚠️ Jira isn't connected yet. Ask your admin to add "
+            "`JIRA_BASE_URL`, `JIRA_EMAIL`, and `JIRA_API_TOKEN` to Railway."
+        )
+
+    jql = (
+        f'assignee = "{assignee_email}" AND resolution = Unresolved '
+        f'ORDER BY priority DESC, updated DESC'
+    ) if assignee_email else (
+        'assignee = currentUser() AND resolution = Unresolved ORDER BY priority DESC, updated DESC'
+    )
+
+    try:
+        resp = http_requests.get(
+            f"{JIRA_BASE_URL}/rest/api/3/search",
+            headers=jira_headers(),
+            params={"jql": jql, "maxResults": 10,
+                    "fields": "summary,status,priority,issuetype,project"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        issues = resp.json().get("issues", [])
+
+        if not issues:
+            return "✅ No open Jira issues assigned to you right now — you're clear!"
+
+        priority_emoji = {
+            "Highest": "🔴", "High": "🟠", "Medium": "🟡",
+            "Low": "🟢", "Lowest": "⚪",
+        }
+        lines = [f"🎯 *Your open Jira issues ({len(issues)}):*\n"]
+        for issue in issues:
+            key     = issue["key"]
+            summary = issue["fields"]["summary"]
+            status  = issue["fields"]["status"]["name"]
+            pri     = issue["fields"].get("priority", {}).get("name", "")
+            emoji   = priority_emoji.get(pri, "⚪")
+            url     = f"{JIRA_BASE_URL}/browse/{key}"
+            lines.append(f"{emoji} *<{url}|{key}>* — {summary}\n   _{status}_")
+
+        return "\n\n".join(lines)
+
+    except Exception as e:
+        return f"Jira error fetching issues: {e}"
+
+
+def create_jira_issue(summary: str, description: str = "",
+                      issue_type: str = "Task", project_key: str = "") -> str:
+    """
+    Create a new Jira issue, auto-detecting the project if none is specified.
+    Returns a confirmation message with the issue key and link.
+    """
+    if not jira_available():
+        return "⚠️ Jira isn't connected. Set JIRA_BASE_URL, JIRA_EMAIL, and JIRA_API_TOKEN in Railway."
+
+    if not project_key:
+        try:
+            r = http_requests.get(
+                f"{JIRA_BASE_URL}/rest/api/3/project",
+                headers=jira_headers(), timeout=10
+            )
+            r.raise_for_status()
+            projects = r.json()
+            if not projects:
+                return "⚠️ No Jira projects found. Check the API token permissions."
+            project_key = projects[0]["key"]
+        except Exception as e:
+            return f"Jira error finding project: {e}"
+
+    body = {
+        "fields": {
+            "project":   {"key": project_key},
+            "summary":   summary,
+            "issuetype": {"name": issue_type},
+            "description": {
+                "type": "doc", "version": 1,
+                "content": [{
+                    "type": "paragraph",
+                    "content": [{"type": "text", "text": description or summary}]
+                }]
+            },
+        }
+    }
+
+    try:
+        resp = http_requests.post(
+            f"{JIRA_BASE_URL}/rest/api/3/issue",
+            headers=jira_headers(), json=body, timeout=10
+        )
+        resp.raise_for_status()
+        key = resp.json()["key"]
+        url = f"{JIRA_BASE_URL}/browse/{key}"
+        return f"✅ Created *<{url}|{key}>*: {summary}\n🔗 {url}"
+    except Exception as e:
+        try:
+            errors = resp.json().get("errorMessages") or resp.json().get("errors")
+            return f"Jira error: {errors}"
+        except Exception:
+            return f"Jira error creating issue: {e}"
+
+
+def update_jira_issue_status(issue_key: str, target_status: str) -> str:
+    """
+    Transition a Jira issue to the closest matching status.
+
+    Fetches the available transitions first and does a case-insensitive
+    substring match so users can say "done", "in progress", "to do", etc.
+    """
+    if not jira_available():
+        return "⚠️ Jira isn't connected."
+
+    url = f"{JIRA_BASE_URL}/rest/api/3/issue/{issue_key.upper()}/transitions"
+    try:
+        resp = http_requests.get(url, headers=jira_headers(), timeout=10)
+        resp.raise_for_status()
+        transitions = resp.json().get("transitions", [])
+
+        match = next(
+            (t for t in transitions if target_status.lower() in t["name"].lower()), None
+        )
+        if not match:
+            available = ", ".join(t["name"] for t in transitions)
+            return (
+                f"⚠️ Can't move *{issue_key}* to '{target_status}'.\n"
+                f"Available transitions: {available}"
+            )
+
+        http_requests.post(
+            url, headers=jira_headers(),
+            json={"transition": {"id": match["id"]}}, timeout=10
+        ).raise_for_status()
+
+        issue_url = f"{JIRA_BASE_URL}/browse/{issue_key.upper()}"
+        return f"✅ *<{issue_url}|{issue_key.upper()}>* moved to *{match['name']}*"
+
+    except Exception as e:
+        return f"Jira error updating status: {e}"
+
+
+def get_sprint_progress() -> str:
+    """
+    Return a visual progress bar and counts for the current active sprint.
+
+    Looks up the first Jira Software board, finds its active sprint, and
+    groups issues by status category (To Do / In Progress / Done).
+    """
+    if not jira_available():
+        return "⚠️ Jira isn't connected."
+
+    try:
+        r = http_requests.get(
+            f"{JIRA_BASE_URL}/rest/agile/1.0/board",
+            headers=jira_headers(), timeout=10
+        )
+        r.raise_for_status()
+        boards = r.json().get("values", [])
+        if not boards:
+            return "No Jira boards found."
+        board_id, board_name = boards[0]["id"], boards[0]["name"]
+
+        r = http_requests.get(
+            f"{JIRA_BASE_URL}/rest/agile/1.0/board/{board_id}/sprint",
+            headers=jira_headers(), params={"state": "active"}, timeout=10
+        )
+        r.raise_for_status()
+        sprints = r.json().get("values", [])
+        if not sprints:
+            return f"No active sprint on *{board_name}* right now."
+
+        sprint      = sprints[0]
+        sprint_id   = sprint["id"]
+        sprint_name = sprint["name"]
+        end_date    = (sprint.get("endDate") or "")[:10] or "—"
+
+        r = http_requests.get(
+            f"{JIRA_BASE_URL}/rest/agile/1.0/sprint/{sprint_id}/issue",
+            headers=jira_headers(),
+            params={"maxResults": 200, "fields": "status,assignee,summary"},
+            timeout=15
+        )
+        r.raise_for_status()
+        issues = r.json().get("issues", [])
+
+        done        = sum(1 for i in issues if i["fields"]["status"]["statusCategory"]["key"] == "done")
+        in_progress = sum(1 for i in issues if i["fields"]["status"]["statusCategory"]["key"] == "indeterminate")
+        todo        = sum(1 for i in issues if i["fields"]["status"]["statusCategory"]["key"] == "new")
+        total       = len(issues)
+        pct         = int(done / total * 100) if total else 0
+        bar         = "█" * int(pct / 10) + "░" * (10 - int(pct / 10))
+
+        return (
+            f"📊 *{sprint_name}* — {board_name}\n"
+            f"🗓️ Ends: {end_date}\n\n"
+            f"`{bar}` *{pct}% complete*\n\n"
+            f"✅ Done: *{done}*   "
+            f"🔄 In Progress: *{in_progress}*   "
+            f"📋 To Do: *{todo}*   "
+            f"📌 Total: *{total}*"
+        )
+
+    except Exception as e:
+        return f"Jira error fetching sprint: {e}"
 
 
 # ---------------------------------------------------------------------------
@@ -1920,11 +2127,22 @@ def send_daily_standup() -> None:
                 task_list = "\n".join(f"• {i['task']}" for i in old_items[:5])
                 carryover = f"\n\n📌 *Carried over from yesterday:*\n{task_list}"
 
+            # Fetch Jira assigned issues for this user (if Jira is connected)
+            jira_section = ""
+            if jira_available():
+                memories   = get_user_memories(team_id, user_id)
+                jira_email = memories.get("jira_email")
+                jira_issues = get_my_jira_issues(jira_email)
+                # Only include if there are actual issues (skip the "not connected" warning)
+                if not jira_issues.startswith("⚠️") and not jira_issues.startswith("✅ No open"):
+                    jira_section = f"\n\n{jira_issues}"
+
             message = (
                 f"Good morning! What are you working on today?\n\n"
                 f"📅 *Your calendar:*\n{calendar_info}"
                 f"{conflict_section}"
                 f"{carryover}"
+                f"{jira_section}"
             )
             client.chat_postMessage(channel=user_id, text=message)
             mark_standup_sent(team_id, user_id)
@@ -2053,6 +2271,90 @@ def process_direct_message(event: dict, say) -> None:
         say(f"📅 Booking option {option_num}...")
         result = handle_book_option(team_id, user, option_num)
         say(result)
+        return
+
+    # --- Jira: register email "my jira email is X" ---
+    jira_email_match = re.search(
+        r'(?:my jira email is|jira email[:\s]+|set jira email to)\s+([\w._%+\-]+@[\w.\-]+\.[a-zA-Z]{2,})',
+        user_message, re.IGNORECASE
+    )
+    if jira_email_match:
+        jira_email = jira_email_match.group(1)
+        update_user_memory(team_id, user, "jira_email", jira_email)
+        say(f"✅ Got it! I'll use *{jira_email}* to filter your Jira issues.")
+        return
+
+    # --- Jira: show my tickets ---
+    if any(p in user_message_lower for p in [
+        "my jira", "jira tickets", "jira issues", "jira tasks",
+        "show jira", "open tickets", "open issues"
+    ]):
+        memories = get_user_memories(team_id, user)
+        jira_email = memories.get("jira_email")
+        say(get_my_jira_issues(jira_email))
+        return
+
+    # --- Jira: sprint progress ---
+    if any(p in user_message_lower for p in [
+        "sprint progress", "sprint status", "how's the sprint",
+        "sprint update", "sprint report", "jira sprint"
+    ]):
+        say(get_sprint_progress())
+        return
+
+    # --- Jira: create issue ---
+    # Patterns: "create jira bug: Login crash", "jira task: Add dark mode", "log a bug: X"
+    jira_create_match = re.search(
+        r'(?:create|add|log|new|open)\s+(?:a\s+)?(?:jira\s+)?'
+        r'(bug|task|story|epic|subtask|improvement|feature)[:\s]+(.+)',
+        user_message, re.IGNORECASE
+    )
+    if jira_create_match or 'create jira' in user_message_lower:
+        if jira_create_match:
+            raw_type = jira_create_match.group(1).strip().title()
+            summary  = jira_create_match.group(2).strip()
+            # Map friendly names to Jira issue type names
+            type_map = {
+                "Bug": "Bug", "Task": "Task", "Story": "Story",
+                "Epic": "Epic", "Feature": "Story", "Improvement": "Task",
+                "Subtask": "Sub-task",
+            }
+            issue_type = type_map.get(raw_type, "Task")
+        else:
+            # Generic "create jira X" — use Claude to extract details
+            try:
+                parse = anthropic.messages.create(
+                    model="claude-sonnet-4-20250514", max_tokens=150,
+                    messages=[{"role": "user", "content":
+                        f'Extract from: "{user_message}"\nReturn JSON: {{"summary": "...", "issue_type": "Task|Bug|Story"}}'
+                    }]
+                )
+                raw = parse.content[0].text.strip().replace('```json','').replace('```','').strip()
+                details   = json.loads(raw)
+                summary    = details.get("summary", user_message)
+                issue_type = details.get("issue_type", "Task")
+            except Exception:
+                summary    = user_message
+                issue_type = "Task"
+        say(create_jira_issue(summary, issue_type=issue_type))
+        return
+
+    # --- Jira: update status  "mark PROJ-123 as done" / "close PROJ-123" ---
+    jira_update_match = re.search(
+        r'(?:mark|move|close|complete|transition|set)\s+'
+        r'([A-Z]+-\d+)\s+(?:as\s+|to\s+)?(.+)',
+        user_message, re.IGNORECASE
+    )
+    if not jira_update_match:
+        # Also match "PROJ-123 is done" style
+        jira_update_match = re.search(
+            r'([A-Z]+-\d+)\s+(?:is\s+|to\s+)?(?:now\s+)?(done|closed|complete|in progress|to do|todo)',
+            user_message, re.IGNORECASE
+        )
+    if jira_update_match:
+        issue_key     = jira_update_match.group(1).upper()
+        target_status = jira_update_match.group(2).strip()
+        say(update_jira_issue_status(issue_key, target_status))
         return
 
     # --- Focus time blocker ---
