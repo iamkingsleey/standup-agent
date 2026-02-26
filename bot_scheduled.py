@@ -1173,13 +1173,30 @@ def slack_events():
     Returns:
         Response: HTTP 200 with Slack's expected response payload.
     """
-    # Ignore Slack's automatic retries to prevent duplicate processing.
+    # Layer 1: Ignore Slack's automatic retries.
     # When our response takes longer than 3 seconds (e.g. Anthropic API call),
     # Slack resends the event with X-Slack-Retry-Num header. We return 200
-    # immediately so Slack stops retrying — the original is still processing.
+    # immediately so Slack stops retrying.
     if request.headers.get("X-Slack-Retry-Num"):
         print(f"Ignoring Slack retry #{request.headers.get('X-Slack-Retry-Num')}")
         return jsonify({"status": "ok"}), 200
+
+    # Layer 2: Deduplicate by event_id as a safety net.
+    # Each unique Slack event has a stable event_id across all delivery attempts.
+    # If we've already processed this event_id, silently return 200.
+    body = request.get_data(as_text=True)
+    try:
+        payload = json.loads(body)
+        event_id = payload.get("event_id")
+        if event_id:
+            if event_id in processed_event_ids:
+                print(f"Ignoring duplicate event: {event_id}")
+                return jsonify({"status": "ok"}), 200
+            processed_event_ids.add(event_id)
+            if len(processed_event_ids) > 1000:
+                processed_event_ids.clear()
+    except Exception:
+        pass
 
     return handler.handle(request)
 
