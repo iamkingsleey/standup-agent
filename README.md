@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Open Source](https://img.shields.io/badge/Open%20Source-%E2%9D%A4-brightgreen)](https://github.com/iamkingsleey/standup-agent)
 
-A smart, open-source Slack bot that acts as your personal AI assistant — powered by Claude (Anthropic) and integrated with Google Calendar. It sends you a daily standup prompt, answers questions, manages your calendar, monitors channel mentions, summarizes conversations, remembers your work context, and proactively keeps you on top of your day — all from your Slack DMs.
+A smart, open-source Slack bot that acts as your personal AI assistant — powered by Claude (Anthropic) and integrated with Google Calendar and Jira. It sends you a daily standup prompt, answers questions, manages your calendar, tracks your Jira tickets, monitors channel mentions, summarizes conversations, remembers your work context, and proactively keeps you on top of your day — all from your Slack DMs.
 
 Deployable to any cloud host. This project uses [Railway](https://railway.app) for production.
 
@@ -70,6 +70,19 @@ The bot detects time + timezone mentions in messages (e.g. "3 PM PST", "14:30 UT
 ### 👀 Mention Monitoring & Auto-Reply
 If someone @mentions you in a channel and you don't respond within 5 minutes, the bot automatically replies on your behalf with a helpful AI-generated response. It skips auto-replies if you're showing as active on Slack or the message contains sensitive keywords.
 
+### 🎫 Jira Cloud Integration
+The bot connects to your Jira Cloud instance so you can manage tickets without leaving Slack. It surfaces your open issues in the morning standup and lets you create, update, and track work via simple DM commands.
+
+Try asking:
+- *"Show my Jira tickets"* → lists all open issues assigned to you with priority emoji and clickable links
+- *"Sprint progress"* → shows a visual progress bar of the active sprint (e.g. `█████░░░░░ 50% complete`)
+- *"Create a bug: Login page crashes on mobile"* → opens a new Bug in your default project
+- *"New story: Add dark mode"* → opens a Story in Jira
+- *"Mark PROJ-42 as done"* → transitions the issue to Done (fuzzy status matching)
+- *"My Jira email is me@company.com"* → registers your email so tickets are filtered to you
+
+Setup requires three environment variables — see [Environment Variables Reference](#environment-variables-reference) below.
+
 ### 🌐 Multi-Workspace Support
 The bot supports multiple Slack workspaces simultaneously. Each workspace installs the bot via OAuth, and each individual user within a workspace can connect their own Google Calendar and get their own personalised experience.
 
@@ -83,6 +96,7 @@ The bot supports multiple Slack workspaces simultaneously. Each workspace instal
 | Web server | Flask + Gunicorn |
 | AI responses | [Anthropic Claude](https://www.anthropic.com/) (`claude-sonnet-4-20250514`) |
 | Calendar | Google Calendar API v3 (OAuth 2.0) |
+| Project tracking | Jira Cloud REST API v3 + Agile API |
 | Database | SQLite (persisted via Railway Volume) |
 | Scheduler | `schedule` library (background thread) |
 | Hosting | [Railway](https://railway.app) |
@@ -134,6 +148,11 @@ SLACK_REDIRECT_URI=https://your-domain.com/slack/oauth_redirect
 ANTHROPIC_API_KEY=your_anthropic_api_key
 
 GOOGLE_CREDENTIALS_JSON={"web":{"client_id":"...","client_secret":"...",...}}
+
+# Optional — enables Jira integration
+JIRA_BASE_URL=https://your-workspace.atlassian.net
+JIRA_EMAIL=you@yourcompany.com
+JIRA_API_TOKEN=your_jira_api_token
 ```
 
 > **Note:** `GOOGLE_CREDENTIALS_JSON` should contain the full JSON content of your Google OAuth Web Application client credentials file. On Railway, paste it as a multi-line environment variable.
@@ -158,7 +177,18 @@ In [Google Cloud Console](https://console.cloud.google.com/):
 3. Add an Authorized Redirect URI: `https://your-domain.com/auth/google/callback`
 4. Download the JSON and paste its contents into the `GOOGLE_CREDENTIALS_JSON` env var
 
-### 6. Run locally
+### 6. Configure Jira (optional)
+
+To enable Jira integration:
+
+1. Log in to [id.atlassian.com/manage-profile/security/api-tokens](https://id.atlassian.com/manage-profile/security/api-tokens) and create an API token
+2. Note your Jira Cloud base URL (e.g. `https://your-workspace.atlassian.net`)
+3. Add three env vars — `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN` — to your Railway dashboard (or `.env` locally)
+4. After deploying, DM the bot: *"my Jira email is you@company.com"* so it can filter issues to your account
+
+The bot will automatically include your open Jira issues in the morning standup once configured.
+
+### 7. Run locally
 
 ```bash
 python3 bot_scheduled.py
@@ -166,7 +196,7 @@ python3 bot_scheduled.py
 
 The server starts on port 3000 by default (override with `PORT` env var). Use [ngrok](https://ngrok.com/) to expose it for local Slack testing.
 
-### 7. Deploy to Railway
+### 8. Deploy to Railway
 
 1. Push this repo to GitHub
 2. Create a new Railway project and connect the repo
@@ -197,6 +227,13 @@ https://your-domain.com/auth/google?team_id=T...&user_id=U...
 ```
 Click it, approve Google's permissions, and your calendar is linked. Every user in the workspace gets their own unique link.
 
+### Connecting Jira
+Once you've added the three Jira env vars and redeployed, tell the bot your Atlassian email:
+```
+my Jira email is you@company.com
+```
+The bot stores this in your long-term memory and uses it to filter Jira issues to your account. Your open issues will then appear in every morning standup alongside your calendar.
+
 ### DM commands
 
 | What you say | What happens |
@@ -213,6 +250,12 @@ Click it, approve Google's permissions, and your calendar is linked. Every user 
 | "what was I working on last week?" | Shows standup history |
 | "summarize #engineering" | Summarizes the last 24h of a channel |
 | "my timezone is EST" | Sets your timezone for time conversions |
+| "show my Jira tickets" | Lists your open Jira issues with priority and links |
+| "sprint progress" | Shows a visual progress bar of the active sprint |
+| "create a bug: Title here" | Opens a new Bug in Jira |
+| "new story: Title here" | Opens a new Story in Jira |
+| "mark PROJ-42 as done" | Transitions a Jira issue to a new status |
+| "my Jira email is X@company.com" | Registers your Jira email for issue filtering |
 | Anything else | Conversational AI reply with full memory context |
 
 ### Slash command
@@ -226,7 +269,7 @@ Click it, approve Google's permissions, and your calendar is linked. Every user 
 
 | When | What the bot sends |
 |---|---|
-| 9:00 AM daily | Morning standup with calendar, conflict warnings, and carryover tasks |
+| 9:00 AM daily | Morning standup with calendar, conflict warnings, carryover tasks, and open Jira issues |
 | ~10 min before each meeting | Pre-meeting briefing with attendees, agenda, and pending tasks |
 | 5:00 PM daily | End-of-day check-in on today's action items |
 | Every Friday 5:00 PM | Weekly retrospective based on your standup history |
@@ -262,6 +305,9 @@ The bot uses a single SQLite file at `data/bot.db` with these tables:
 | `SLACK_REDIRECT_URI` | ✅ | Full URL to `/slack/oauth_redirect` on your host |
 | `ANTHROPIC_API_KEY` | ✅ | From [Anthropic Console](https://console.anthropic.com/) |
 | `GOOGLE_CREDENTIALS_JSON` | ✅ | Full JSON content of your Google OAuth Web App client |
+| `JIRA_BASE_URL` | ❌ | Your Jira Cloud URL, e.g. `https://yourworkspace.atlassian.net` |
+| `JIRA_EMAIL` | ❌ | The Atlassian account email used to generate the API token |
+| `JIRA_API_TOKEN` | ❌ | API token from [id.atlassian.com/manage-profile/security/api-tokens](https://id.atlassian.com/manage-profile/security/api-tokens) |
 | `PORT` | ❌ | Server port (default: 3000; Railway sets this automatically) |
 
 ---
@@ -274,6 +320,7 @@ The bot uses a single SQLite file at `data/bot.db` with these tables:
 - **Per-user calendar tokens** — Google OAuth tokens are stored with a `(team_id, user_id)` composite key so every Slack user in every workspace has their own independent calendar connection.
 - **Async background tasks** — memory extraction and action item parsing run in background daemon threads after each reply so they never slow down the user-facing response.
 - **Proactive scheduler** — all proactive features (briefings, EOD follow-up, weekly retro) run in a single background scheduler thread using the `schedule` library, checked every 60 seconds.
+- **Jira via service account** — Jira uses a single API token (Basic Auth) shared across the deployment. Per-user filtering is achieved by storing each user's Atlassian email in `user_memories` and passing it as a JQL `assignee` filter. No per-user OAuth is required.
 
 ---
 
