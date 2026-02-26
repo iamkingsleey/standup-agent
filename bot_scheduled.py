@@ -1016,8 +1016,15 @@ def health_check():
 # Entry Point
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
-    # Initialise the SQLite database and create tables if they don't exist yet
+def startup() -> None:
+    """
+    Initialise the database and start the background scheduler.
+
+    This is called at module load time so it runs whether the app is started
+    via Gunicorn (production) or python3 directly (local development).
+    Gunicorn does not execute the __main__ block, so startup logic must live
+    here at module level.
+    """
     init_db()
 
     print("Bot is running in HTTP mode!")
@@ -1028,11 +1035,16 @@ if __name__ == "__main__":
     print("Auto-response monitoring enabled - will respond if you don't reply in 5 min")
     print("Calendar features: read, create, delete events with attendees")
 
-    # Start the schedule loop in a background daemon thread so it runs
-    # alongside the Flask web server without blocking
     scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
     scheduler_thread.start()
 
-    # Railway injects a PORT environment variable — always use it in production
+
+# Run startup immediately when the module is imported (works with both
+# Gunicorn and direct python3 execution)
+startup()
+
+
+if __name__ == "__main__":
+    # Local development only — Gunicorn handles this in production
     port = int(os.environ.get("PORT", 3000))
     flask_app.run(host="0.0.0.0", port=port)
