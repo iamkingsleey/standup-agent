@@ -258,6 +258,54 @@ def init_db() -> None:
             PRIMARY KEY (team_id, user_id)
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS standup_responses (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            team_id    TEXT NOT NULL,
+            user_id    TEXT NOT NULL,
+            response   TEXT NOT NULL,
+            date       TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS action_items (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            team_id    TEXT NOT NULL,
+            user_id    TEXT NOT NULL,
+            task       TEXT NOT NULL,
+            status     TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_memories (
+            team_id      TEXT NOT NULL,
+            user_id      TEXT NOT NULL,
+            memory_key   TEXT NOT NULL,
+            memory_value TEXT NOT NULL,
+            updated_at   TEXT NOT NULL,
+            PRIMARY KEY (team_id, user_id, memory_key)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS briefings_sent (
+            team_id  TEXT NOT NULL,
+            user_id  TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            sent_at  TEXT NOT NULL,
+            PRIMARY KEY (team_id, user_id, event_id)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS standup_sent (
+            team_id   TEXT NOT NULL,
+            user_id   TEXT NOT NULL,
+            sent_date TEXT NOT NULL,
+            PRIMARY KEY (team_id, user_id, sent_date)
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -395,6 +443,632 @@ def get_all_workspaces() -> list[tuple]:
     rows = conn.execute("SELECT team_id, user_id FROM workspace_owners").fetchall()
     conn.close()
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Standup Response Storage
+# ---------------------------------------------------------------------------
+
+def save_standup_response(team_id: str, user_id: str, response: str) -> None:
+    """Persist a user's standup reply for history and weekly retro generation."""
+    conn = sqlite3.connect("data/bot.db")
+    conn.execute(
+        "INSERT INTO standup_responses (team_id, user_id, response, date, created_at) VALUES (?, ?, ?, ?, ?)",
+        (team_id, user_id, response, datetime.date.today().isoformat(),
+         datetime.datetime.utcnow().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_standup_history(team_id: str, user_id: str, days: int = 30) -> list:
+    """Retrieve the user's standup responses for the past N days."""
+    since = (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
+    conn = sqlite3.connect("data/bot.db")
+    rows = conn.execute(
+        "SELECT date, response FROM standup_responses "
+        "WHERE team_id=? AND user_id=? AND date>=? ORDER BY date DESC",
+        (team_id, user_id, since)
+    ).fetchall()
+    conn.close()
+    return [{"date": r[0], "response": r[1]} for r in rows]
+
+
+def mark_standup_sent(team_id: str, user_id: str) -> None:
+    """Record that today's standup was sent to this user."""
+    conn = sqlite3.connect("data/bot.db")
+    conn.execute(
+        "INSERT OR IGNORE INTO standup_sent (team_id, user_id, sent_date) VALUES (?, ?, ?)",
+        (team_id, user_id, datetime.date.today().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+
+def standup_sent_today(team_id: str, user_id: str) -> bool:
+    """Check whether we already sent today's standup to this user."""
+    conn = sqlite3.connect("data/bot.db")
+    row = conn.execute(
+        "SELECT 1 FROM standup_sent WHERE team_id=? AND user_id=? AND sent_date=?",
+        (team_id, user_id, datetime.date.today().isoformat())
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+# ---------------------------------------------------------------------------
+# Action Item Storage
+# ---------------------------------------------------------------------------
+
+def save_action_items(team_id: str, user_id: str, items: list) -> int:
+    """Persist a list of extracted tasks. Returns the number saved."""
+    if not items:
+        return 0
+    conn = sqlite3.connect("data/bot.db")
+    now = datetime.datetime.utcnow().isoformat()
+    count = 0
+    for item in items:
+        if item and item.strip():
+            conn.execute(
+                "INSERT INTO action_items (team_id, user_id, task, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, 'pending', ?, ?)",
+                (team_id, user_id, item.strip(), now, now)
+            )
+            count += 1
+    conn.commit()
+    conn.close()
+    return count
+
+
+def get_pending_action_items(team_id: str, user_id: str) -> list:
+    """Return all pending action items for a user."""
+    conn = sqlite3.connect("data/bot.db")
+    rows = conn.execute(
+        "SELECT id, task, created_at FROM action_items "
+        "WHERE team_id=? AND user_id=? AND status='pending' ORDER BY created_at DESC",
+        (team_id, user_id)
+    ).fetchall()
+    conn.close()
+    return [{"id": r[0], "task": r[1], "created_at": r[2]} for r in rows]
+
+
+def get_todays_action_items(team_id: str, user_id: str) -> list:
+    """Return pending action items created today."""
+    today = datetime.date.today().isoformat()
+    conn = sqlite3.connect("data/bot.db")
+    rows = conn.execute(
+        "SELECT id, task FROM action_items "
+        "WHERE team_id=? AND user_id=? AND status='pending' AND date(created_at)=?",
+        (team_id, user_id, today)
+    ).fetchall()
+    conn.close()
+    return [{"id": r[0], "task": r[1]} for r in rows]
+
+
+def mark_all_todays_items_done(team_id: str, user_id: str) -> int:
+    """Mark all of today's pending action items as done. Returns count updated."""
+    today = datetime.date.today().isoformat()
+    now = datetime.datetime.utcnow().isoformat()
+    conn = sqlite3.connect("data/bot.db")
+    cursor = conn.execute(
+        "UPDATE action_items SET status='done', updated_at=? "
+        "WHERE team_id=? AND user_id=? AND status='pending' AND date(created_at)=?",
+        (now, team_id, user_id, today)
+    )
+    count = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return count
+
+
+def dismiss_all_pending_items(team_id: str, user_id: str) -> None:
+    """Mark all pending action items as dismissed (user said they're not relevant)."""
+    conn = sqlite3.connect("data/bot.db")
+    conn.execute(
+        "UPDATE action_items SET status='dismissed', updated_at=? WHERE team_id=? AND user_id=? AND status='pending'",
+        (datetime.datetime.utcnow().isoformat(), team_id, user_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Long-term Memory
+# ---------------------------------------------------------------------------
+
+def get_user_memories(team_id: str, user_id: str) -> dict:
+    """Return all stored memory key-value pairs for a user."""
+    conn = sqlite3.connect("data/bot.db")
+    rows = conn.execute(
+        "SELECT memory_key, memory_value FROM user_memories WHERE team_id=? AND user_id=?",
+        (team_id, user_id)
+    ).fetchall()
+    conn.close()
+    return {r[0]: r[1] for r in rows}
+
+
+def update_user_memory(team_id: str, user_id: str, key: str, value: str) -> None:
+    """Upsert a single memory fact for a user."""
+    conn = sqlite3.connect("data/bot.db")
+    conn.execute(
+        "INSERT OR REPLACE INTO user_memories (team_id, user_id, memory_key, memory_value, updated_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (team_id, user_id, key, value, datetime.datetime.utcnow().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+
+def build_memory_context(team_id: str, user_id: str) -> str:
+    """Format stored memories as a string to inject into the AI system prompt."""
+    memories = get_user_memories(team_id, user_id)
+    if not memories:
+        return ""
+    lines = ["Long-term memory about this user:"]
+    for key, value in memories.items():
+        lines.append(f"  • {key}: {value}")
+    return "\n".join(lines)
+
+
+def extract_and_update_memories_async(team_id: str, user_id: str, conversation: str) -> None:
+    """
+    Run in a background thread: ask Claude to extract memorable facts from a
+    conversation and persist them to user_memories. Keeps the DM response fast
+    since this runs after the reply has already been sent.
+    """
+    def _run():
+        try:
+            existing = get_user_memories(team_id, user_id)
+            existing_str = json.dumps(existing) if existing else "{}"
+            response = anthropic.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=400,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        "Extract key long-term facts worth remembering about the user from this conversation.\n"
+                        "Focus on: active projects, deadlines, teammates, tools/tech, preferences, ongoing blockers.\n"
+                        "Return ONLY a JSON object where keys are short category labels and values are brief descriptions.\n"
+                        "Only include genuinely new or meaningfully updated facts. Return {} if nothing notable.\n"
+                        f"Existing memory: {existing_str}\n\n"
+                        f"Conversation:\n{conversation}"
+                    )
+                }]
+            )
+            text = response.content[0].text.strip().replace('```json', '').replace('```', '').strip()
+            new_facts = json.loads(text)
+            for key, value in new_facts.items():
+                if key and value:
+                    update_user_memory(team_id, user_id, key, str(value))
+        except Exception as e:
+            print(f"Memory extraction error: {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def extract_action_items_async(team_id: str, user_id: str, text: str) -> None:
+    """
+    Run in a background thread: ask Claude to pull out concrete tasks from a
+    message and persist them to action_items.
+    """
+    def _run():
+        try:
+            response = anthropic.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=300,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        "Extract specific action items / tasks from this standup or message.\n"
+                        "Return ONLY a JSON array of short task strings (each under 100 chars).\n"
+                        "Only include concrete things the person said they will do today. Return [] if none.\n\n"
+                        f"Text: {text}"
+                    )
+                }]
+            )
+            raw = response.content[0].text.strip().replace('```json', '').replace('```', '').strip()
+            items = json.loads(raw)
+            saved = save_action_items(team_id, user_id, [str(i) for i in items if i])
+            if saved:
+                print(f"Saved {saved} action items for user {user_id}")
+        except Exception as e:
+            print(f"Action item extraction error: {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# Pre-meeting Briefings
+# ---------------------------------------------------------------------------
+
+def get_all_calendar_users() -> list:
+    """Return all (team_id, user_id) pairs that have Google Calendar connected."""
+    conn = sqlite3.connect("data/bot.db")
+    rows = conn.execute(
+        "SELECT team_id, user_id FROM google_tokens WHERE user_id != ''"
+    ).fetchall()
+    conn.close()
+    return list(rows)
+
+
+def has_briefing_been_sent(team_id: str, user_id: str, event_id: str) -> bool:
+    conn = sqlite3.connect("data/bot.db")
+    row = conn.execute(
+        "SELECT 1 FROM briefings_sent WHERE team_id=? AND user_id=? AND event_id=?",
+        (team_id, user_id, event_id)
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def record_briefing_sent(team_id: str, user_id: str, event_id: str) -> None:
+    conn = sqlite3.connect("data/bot.db")
+    conn.execute(
+        "INSERT OR IGNORE INTO briefings_sent (team_id, user_id, event_id, sent_at) VALUES (?, ?, ?, ?)",
+        (team_id, user_id, event_id, datetime.datetime.utcnow().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+
+def generate_meeting_briefing(event: dict, team_id: str, user_id: str) -> str:
+    """
+    Build a short pre-meeting prep DM for an upcoming calendar event.
+
+    Pulls the event title, attendees, description, and the user's pending
+    action items, then asks Claude to format a concise briefing.
+    """
+    title = event.get('summary', 'Untitled Meeting')
+    start_raw = event.get('start', {}).get('dateTime', '')
+    try:
+        start_dt = datetime.datetime.fromisoformat(start_raw.replace('Z', '+00:00'))
+        start_str = start_dt.strftime('%I:%M %p')
+    except Exception:
+        start_str = start_raw
+
+    attendees = [
+        a.get('email', '') for a in event.get('attendees', [])
+        if not a.get('self') and a.get('email')
+    ]
+    description = (event.get('description') or '')[:300]
+    pending = get_pending_action_items(team_id, user_id)
+    items_str = "\n".join(f"• {i['task']}" for i in pending[:5]) if pending else "None"
+
+    try:
+        response = anthropic.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=350,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Write a concise pre-meeting briefing for a Slack DM (under 180 words).\n"
+                    f"Meeting: {title} at {start_str}\n"
+                    f"Attendees: {', '.join(attendees) if attendees else 'Team only'}\n"
+                    f"Agenda: {description or 'Not provided'}\n"
+                    f"User's pending tasks: {items_str}\n\n"
+                    f"Include: who's attending, key agenda points, any relevant pending tasks, "
+                    f"and 1-2 quick prep tips. Be direct and practical."
+                )
+            }]
+        )
+        body = response.content[0].text
+    except Exception:
+        body = f"You have *{title}* with {', '.join(attendees) if attendees else 'your team'}. Make sure you're prepared!"
+
+    return f"📋 *Meeting in ~10 minutes: {title}*\n\n{body}"
+
+
+def check_and_send_meeting_briefings() -> None:
+    """
+    Scheduled every 5 minutes. Finds calendar events starting in 8-12 minutes
+    for all connected users and sends a pre-meeting briefing DM if not yet sent.
+    """
+    users = get_all_calendar_users()
+    now_utc = datetime.datetime.utcnow()
+
+    for team_id, user_id in users:
+        try:
+            bot_token = get_installation_token(team_id)
+            if not bot_token:
+                continue
+
+            service = get_calendar_service(team_id, user_id)
+            if not service:
+                continue
+
+            window_start = (now_utc + datetime.timedelta(minutes=8)).isoformat() + 'Z'
+            window_end   = (now_utc + datetime.timedelta(minutes=12)).isoformat() + 'Z'
+
+            result = service.events().list(
+                calendarId='primary',
+                timeMin=window_start,
+                timeMax=window_end,
+                singleEvents=True,
+                orderBy='startTime'
+            ).execute()
+
+            for event in result.get('items', []):
+                event_id = event.get('id')
+                if not event_id or has_briefing_been_sent(team_id, user_id, event_id):
+                    continue
+                briefing = generate_meeting_briefing(event, team_id, user_id)
+                WebClient(token=bot_token).chat_postMessage(channel=user_id, text=briefing)
+                record_briefing_sent(team_id, user_id, event_id)
+                print(f"Briefing sent to {user_id} for '{event.get('summary')}'")
+
+        except Exception as e:
+            print(f"Briefing check error for {user_id} in {team_id}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# End-of-day Follow-up
+# ---------------------------------------------------------------------------
+
+def send_eod_followup() -> None:
+    """
+    Scheduled at 17:00. If a user has pending action items from today's standup,
+    send a friendly check-in asking how they got on.
+    """
+    users = get_all_calendar_users()
+    for team_id, user_id in users:
+        try:
+            items = get_todays_action_items(team_id, user_id)
+            if not items:
+                continue
+            bot_token = get_installation_token(team_id)
+            if not bot_token:
+                continue
+            task_list = "\n".join(
+                f"{i + 1}. {item['task']}" for i, item in enumerate(items)
+            )
+            message = (
+                f"👋 *End-of-day check-in!*\n\n"
+                f"Here are the tasks you mentioned this morning:\n{task_list}\n\n"
+                f"How'd it go? Reply *done* to mark them all complete, or tell me what's still in progress."
+            )
+            WebClient(token=bot_token).chat_postMessage(channel=user_id, text=message)
+            print(f"EOD follow-up sent to {user_id} in {team_id}")
+        except Exception as e:
+            print(f"EOD follow-up error for {user_id} in {team_id}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Weekly Retrospective
+# ---------------------------------------------------------------------------
+
+def send_weekly_retro() -> None:
+    """
+    Scheduled every Friday at 17:00. Generates a personalised weekly retro
+    from the user's standup history and posts it as a DM.
+    """
+    workspaces = get_all_workspaces()
+    for team_id, user_id in workspaces:
+        try:
+            history = get_standup_history(team_id, user_id, days=7)
+            if not history:
+                continue
+            bot_token = get_installation_token(team_id)
+            if not bot_token:
+                continue
+
+            history_text = "\n\n".join(
+                f"*{e['date']}:* {e['response']}" for e in reversed(history)
+            )
+            response = anthropic.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=700,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        "Generate a friendly, personal weekly retrospective from this person's standup updates.\n"
+                        "Structure it exactly as:\n"
+                        "🏆 *Wins this week*\n"
+                        "🔄 *Recurring themes*\n"
+                        "🚧 *Blockers & challenges*\n"
+                        "🎯 *Suggested focus for next week*\n\n"
+                        "Keep it encouraging, specific, and under 250 words.\n\n"
+                        f"Standup history:\n{history_text}"
+                    )
+                }]
+            )
+            retro = response.content[0].text
+            week_str = datetime.date.today().strftime('%B %d')
+            WebClient(token=bot_token).chat_postMessage(
+                channel=user_id,
+                text=f"🗓️ *Weekly Retro — week of {week_str}*\n\n{retro}"
+            )
+            print(f"Weekly retro sent to {user_id} in {team_id}")
+        except Exception as e:
+            print(f"Weekly retro error for {user_id} in {team_id}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Autonomous Scheduling — Find Free Slots & Focus Time
+# ---------------------------------------------------------------------------
+
+def find_free_slots(team_id: str, user_id: str, duration_minutes: int = 60,
+                    days_ahead: int = 5) -> list:
+    """
+    Scan the user's calendar over the next N business days and return up to 3
+    free windows long enough to accommodate `duration_minutes`.
+
+    Returns a list of dicts: {start, end, date_str, time_str}
+    """
+    service = get_calendar_service(team_id, user_id)
+    if not service:
+        return []
+
+    slots = []
+    now = datetime.datetime.utcnow()
+
+    for day_offset in range(1, days_ahead + 1):
+        target = now + datetime.timedelta(days=day_offset)
+        if target.weekday() >= 5:          # skip weekends
+            continue
+
+        day_start = target.replace(hour=9,  minute=0, second=0, microsecond=0)
+        day_end   = target.replace(hour=18, minute=0, second=0, microsecond=0)
+
+        result = service.events().list(
+            calendarId='primary',
+            timeMin=day_start.isoformat() + 'Z',
+            timeMax=day_end.isoformat() + 'Z',
+            singleEvents=True,
+            orderBy='startTime'
+        ).execute()
+
+        # Build sorted list of busy (start, end) pairs
+        busy = []
+        for ev in result.get('items', []):
+            s = ev['start'].get('dateTime')
+            e = ev['end'].get('dateTime')
+            if s and e:
+                try:
+                    bs = datetime.datetime.fromisoformat(s.replace('Z', '+00:00')).replace(tzinfo=None)
+                    be = datetime.datetime.fromisoformat(e.replace('Z', '+00:00')).replace(tzinfo=None)
+                    busy.append((bs, be))
+                except Exception:
+                    pass
+        busy.sort()
+
+        cursor = day_start
+        for bs, be in busy:
+            gap = (bs - cursor).total_seconds() / 60
+            if gap >= duration_minutes:
+                slots.append({
+                    "start": cursor,
+                    "end": cursor + datetime.timedelta(minutes=duration_minutes),
+                    "date_str": cursor.strftime("%A, %B %d"),
+                    "time_str": cursor.strftime("%I:%M %p")
+                })
+            cursor = max(cursor, be)
+            if len(slots) >= 3:
+                return slots
+
+        # Gap after last event
+        if (day_end - cursor).total_seconds() / 60 >= duration_minutes:
+            slots.append({
+                "start": cursor,
+                "end": cursor + datetime.timedelta(minutes=duration_minutes),
+                "date_str": cursor.strftime("%A, %B %d"),
+                "time_str": cursor.strftime("%I:%M %p")
+            })
+
+        if len(slots) >= 3:
+            return slots
+
+    return slots
+
+
+def handle_find_a_time(team_id: str, user_id: str, user_message: str) -> str:
+    """
+    Parse a natural-language 'find a time' request, search the user's calendar
+    for free slots, and return a formatted list of options.
+    """
+    # Extract duration and attendee info with Claude
+    try:
+        parse_resp = anthropic.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=200,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f'Extract from this message: "{user_message}"\n'
+                    "Return ONLY JSON with: duration_minutes (int, default 60), "
+                    "attendee (string name or email or null), purpose (string or null)"
+                )
+            }]
+        )
+        raw = parse_resp.content[0].text.strip().replace('```json', '').replace('```', '').strip()
+        details = json.loads(raw)
+        duration = int(details.get('duration_minutes') or 60)
+        attendee = details.get('attendee') or ''
+        purpose  = details.get('purpose') or 'meeting'
+    except Exception:
+        duration = 60
+        attendee = ''
+        purpose  = 'meeting'
+
+    slots = find_free_slots(team_id, user_id, duration_minutes=duration)
+    if not slots:
+        return (
+            f"I couldn't find a free {duration}-minute window in the next 5 business days. "
+            f"Your calendar looks fully booked — want me to check further out?"
+        )
+
+    lines = [f"🗓️ Here are your next available {duration}-minute slots:\n"]
+    for i, slot in enumerate(slots, 1):
+        lines.append(f"*Option {i}:* {slot['date_str']} at {slot['time_str']}")
+
+    with_str = f" with {attendee}" if attendee else ""
+    lines.append(
+        f"\nReply *book option 1*, *book option 2*, or *book option 3* to schedule "
+        f"your {purpose}{with_str} — I'll create the calendar event."
+    )
+    return "\n".join(lines)
+
+
+def handle_book_option(team_id: str, user_id: str, option_num: int,
+                       attendee_email: str | None = None) -> str:
+    """Book the Nth free slot from the most recent find_free_slots call."""
+    slots = find_free_slots(team_id, user_id, duration_minutes=60)
+    if not slots or option_num > len(slots):
+        return "I couldn't re-find that slot. Please run 'find a time' again."
+    slot = slots[option_num - 1]
+    result = create_calendar_event(
+        team_id, user_id, "Meeting",
+        slot["start"], 60,
+        [attendee_email] if attendee_email else None
+    )
+    return f"✅ Done! Booked for *{slot['date_str']} at {slot['time_str']}*\n\n{result}"
+
+
+def check_calendar_conflicts(team_id: str, user_id: str) -> str | None:
+    """
+    Check today's calendar for back-to-back meetings with no break or overlapping
+    events. Returns a warning string if conflicts exist, else None.
+    """
+    service = get_calendar_service(team_id, user_id)
+    if not service:
+        return None
+
+    now = datetime.datetime.utcnow()
+    day_start = now.replace(hour=0,  minute=0, second=0, microsecond=0).isoformat() + 'Z'
+    day_end   = now.replace(hour=23, minute=59, second=59, microsecond=0).isoformat() + 'Z'
+
+    try:
+        result = service.events().list(
+            calendarId='primary', timeMin=day_start, timeMax=day_end,
+            singleEvents=True, orderBy='startTime'
+        ).execute()
+    except Exception:
+        return None
+
+    events = [
+        e for e in result.get('items', [])
+        if e['start'].get('dateTime')
+    ]
+
+    warnings = []
+    for i in range(len(events) - 1):
+        try:
+            end_curr  = datetime.datetime.fromisoformat(
+                events[i]['end']['dateTime'].replace('Z', '+00:00')).replace(tzinfo=None)
+            start_next = datetime.datetime.fromisoformat(
+                events[i + 1]['start']['dateTime'].replace('Z', '+00:00')).replace(tzinfo=None)
+            gap = (start_next - end_curr).total_seconds() / 60
+            if gap < 0:
+                warnings.append(
+                    f"⚠️ *{events[i]['summary']}* overlaps with *{events[i+1]['summary']}*"
+                )
+            elif gap < 5:
+                warnings.append(
+                    f"⚠️ No break between *{events[i]['summary']}* and *{events[i+1]['summary']}*"
+                )
+        except Exception:
+            pass
+
+    return "\n".join(warnings) if warnings else None
 
 
 def get_user_timezone(team_id: str, user_id: str) -> str:
@@ -1232,19 +1906,39 @@ def send_daily_standup() -> None:
 
             client = WebClient(token=bot_token)
             calendar_info = get_events_for_date(team_id, user_id, 0)
+
+            # Check for calendar conflicts and append a warning if found
+            conflict_warn = check_calendar_conflicts(team_id, user_id)
+            conflict_section = f"\n\n⚠️ *Scheduling conflicts today:*\n{conflict_warn}" if conflict_warn else ""
+
+            # Fetch pending action items carried over from previous days
+            all_pending = get_pending_action_items(team_id, user_id)
+            old_items = [i for i in all_pending
+                         if i['created_at'][:10] < datetime.date.today().isoformat()]
+            carryover = ""
+            if old_items:
+                task_list = "\n".join(f"• {i['task']}" for i in old_items[:5])
+                carryover = f"\n\n📌 *Carried over from yesterday:*\n{task_list}"
+
             message = (
                 f"Good morning! What are you working on today?\n\n"
-                f"Your calendar:\n{calendar_info}"
+                f"📅 *Your calendar:*\n{calendar_info}"
+                f"{conflict_section}"
+                f"{carryover}"
             )
             client.chat_postMessage(channel=user_id, text=message)
+            mark_standup_sent(team_id, user_id)
             print(f"Daily standup sent to {user_id} in workspace {team_id}")
 
         except Exception as e:
             print(f"Error sending standup to workspace {team_id}: {e}")
 
 
-# Register the standup job — fires every day at 09:00
-schedule.every().day.at("09:00").do(send_daily_standup)
+# Register all scheduled jobs
+schedule.every().day.at("09:00").do(send_daily_standup)           # Morning standup
+schedule.every(5).minutes.do(check_and_send_meeting_briefings)    # Pre-meeting briefings
+schedule.every().day.at("17:00").do(send_eod_followup)            # End-of-day check-in
+schedule.every().friday.at("17:00").do(send_weekly_retro)         # Weekly retrospective
 
 
 def run_scheduler() -> None:
@@ -1306,6 +2000,81 @@ def process_direct_message(event: dict, say) -> None:
         # Don't return — still process the message so the bot responds normally
 
     print(f"Processing DM: {user_message[:50]}...")
+
+    # --- EOD "done" shortcut: user marks today's action items as complete ---
+    if user_message_lower.strip() in ('done', 'all done', 'yes all done', 'finished', 'completed'):
+        count = mark_all_todays_items_done(team_id, user)
+        if count:
+            say(f"✅ Great work! Marked *{count} task{'s' if count != 1 else ''}* as done for today. 🎉")
+            return
+        # Fall through to normal processing if no tasks to mark
+
+    # --- Action item query: "what are my tasks / action items?" ---
+    if any(p in user_message_lower for p in [
+        "my tasks", "action items", "my to-do", "my todo", "what do i have to do",
+        "pending tasks", "open tasks", "what should i work on"
+    ]):
+        items = get_pending_action_items(team_id, user)
+        if items:
+            task_list = "\n".join(f"{i+1}. {item['task']}" for i, item in enumerate(items))
+            say(f"📋 *Your pending tasks ({len(items)} total):*\n\n{task_list}\n\nReply *done* to mark today's tasks complete.")
+        else:
+            say("✅ You have no pending tasks right now. You're all caught up!")
+        return
+
+    # --- Memory query: "what was I working on last week/month?" ---
+    if any(p in user_message_lower for p in [
+        "what was i working on", "what did i work on", "what have i been doing",
+        "my history", "last week", "last month", "past week", "recent work"
+    ]):
+        days = 30 if any(w in user_message_lower for w in ["month", "30"]) else 7
+        history = get_standup_history(team_id, user, days=days)
+        if history:
+            summary = "\n".join(f"*{e['date']}:* {e['response'][:120]}" for e in history[:10])
+            say(f"🗂️ *Your work history (last {days} days):*\n\n{summary}")
+        else:
+            say("I don't have any standup history for you yet. Reply to the morning standup each day and I'll track it.")
+        return
+
+    # --- Find a time: "find a time with X" / "check my availability" ---
+    if any(p in user_message_lower for p in [
+        "find a time", "find time", "check availability", "when am i free",
+        "when are we free", "schedule a meeting with", "find a slot"
+    ]):
+        say("🔍 Checking your calendar for free slots...")
+        result = handle_find_a_time(team_id, user, user_message)
+        say(result)
+        return
+
+    # --- Book an option from a previous find-a-time ---
+    book_match = re.match(r'book\s+option\s+([123])', user_message_lower.strip())
+    if book_match:
+        option_num = int(book_match.group(1))
+        say(f"📅 Booking option {option_num}...")
+        result = handle_book_option(team_id, user, option_num)
+        say(result)
+        return
+
+    # --- Focus time blocker ---
+    if any(p in user_message_lower for p in [
+        "block focus time", "focus block", "protect focus", "block my calendar",
+        "block some time", "deep work block", "no meeting block"
+    ]):
+        say("🎯 Finding the next available focus window...")
+        # Extract requested duration (default 2 hours)
+        dur_match = re.search(r'(\d+)\s*(?:hour|hr)', user_message_lower)
+        duration = int(dur_match.group(1)) * 60 if dur_match else 120
+        slots = find_free_slots(team_id, user, duration_minutes=duration, days_ahead=3)
+        if not slots:
+            say("Your calendar is packed for the next 3 days — no free windows found.")
+        else:
+            slot = slots[0]
+            result = create_calendar_event(
+                team_id, user, "🎯 Focus Time",
+                slot["start"], duration, None
+            )
+            say(f"✅ Blocked *{duration // 60}h of focus time* on *{slot['date_str']} at {slot['time_str']}*\n\n{result}")
+        return
 
     # --- Timezone setting: "my timezone is EST" / "set timezone to WAT" ---
     tz_set_match = re.search(
@@ -1452,14 +2221,19 @@ Today's date is {datetime.datetime.now().strftime('%Y-%m-%d')}"""
     full_message = user_message + calendar_info
     messages = history + [{"role": "user", "content": full_message}]
 
+    # Inject long-term memory into the system prompt so the AI knows the user
+    memory_context = build_memory_context(team_id, user)
+    system_prompt = (
+        "You are a smart personal assistant in Slack. You help with calendar management, "
+        "scheduling, answering questions, and workspace productivity. Be concise and friendly. "
+        "Remember context from earlier in the conversation.\n\n"
+        f"{memory_context}"
+    )
+
     response = anthropic.messages.create(
         model="claude-sonnet-4-20250514",
         max_tokens=1000,
-        system=(
-            "You are a smart personal assistant in Slack. You help with calendar management, "
-            "scheduling, answering questions, and workspace productivity. Be concise and friendly. "
-            "Remember context from earlier in the conversation."
-        ),
+        system=system_prompt,
         messages=messages
     )
 
@@ -1476,6 +2250,17 @@ Today's date is {datetime.datetime.now().strftime('%Y-%m-%d')}"""
     update_user_history(team_id, user, "assistant", reply)
 
     say(reply)
+
+    # --- Background async tasks (don't block the response) ---
+
+    # If this looks like a standup reply, save it and extract action items
+    if standup_sent_today(team_id, user) and len(user_message) > 30:
+        save_standup_response(team_id, user, user_message)
+        extract_action_items_async(team_id, user, user_message)
+
+    # Extract and update long-term memories from this conversation
+    convo_snapshot = f"User: {user_message}\nAssistant: {reply}"
+    extract_and_update_memories_async(team_id, user, convo_snapshot)
 
 
 # ---------------------------------------------------------------------------
