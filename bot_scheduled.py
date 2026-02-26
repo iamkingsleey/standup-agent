@@ -8,14 +8,19 @@ A Slack bot that acts as a personal AI assistant. It:
   - Responds directly when @mentioned in any channel it has been added to
   - Supports creating, reading, and deleting Google Calendar events via natural language in DMs
 
+Transport:
+  This bot uses HTTP mode (Flask) — Slack sends events to a public webhook URL.
+  This is required for Slack App Directory distribution and cloud hosting on Railway.
+
 Setup:
   1. Copy .env.example to .env and fill in your credentials
   2. Place your Google OAuth credentials in credentials.json
   3. Run: python3 bot_scheduled.py
   4. On first run, a browser window will open for Google Calendar authorization
+  5. Set the Slack Event Subscriptions Request URL to: https://<your-railway-url>/slack/events
 
 Dependencies:
-  slack-bolt, anthropic, google-auth, google-api-python-client, schedule, python-dotenv
+  slack-bolt, flask, anthropic, google-auth, google-api-python-client, schedule, python-dotenv
 
 Author: Kingsley Mkpandiok
 """
@@ -28,8 +33,9 @@ import time
 import threading
 import json
 
+from flask import Flask, request, jsonify
 from slack_bolt import App
-from slack_bolt.adapter.socket_mode import SocketModeHandler
+from slack_bolt.adapter.flask import SlackRequestHandler
 from anthropic import Anthropic
 from dotenv import load_dotenv
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -43,8 +49,18 @@ load_dotenv()
 # App Initialization
 # ---------------------------------------------------------------------------
 
-# Slack Bolt app — authenticates using the bot token from .env
-app = App(token=os.environ.get("SLACK_BOT_TOKEN"))
+# Slack Bolt app — authenticates using the bot token and signing secret from .env.
+# The signing secret is used to verify that incoming requests genuinely come from Slack.
+app = App(
+    token=os.environ.get("SLACK_BOT_TOKEN"),
+    signing_secret=os.environ.get("SLACK_SIGNING_SECRET")
+)
+
+# Flask web server — Slack sends all events to this server via HTTP POST
+flask_app = Flask(__name__)
+
+# SlackRequestHandler bridges Flask and Slack Bolt
+handler = SlackRequestHandler(app)
 
 # Anthropic client — used for all AI-generated responses
 anthropic = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
@@ -765,18 +781,52 @@ def handle_message_event(event: dict, say) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Flask Routes
+# ---------------------------------------------------------------------------
+
+@flask_app.route("/slack/events", methods=["POST"])
+def slack_events():
+    """
+    Webhook endpoint that receives all incoming Slack events.
+
+    Slack sends an HTTP POST to this URL every time an event occurs
+    (messages, mentions, reactions, etc.). The SlackRequestHandler
+    verifies the request signature and dispatches it to the correct
+    Slack Bolt event handler above.
+
+    Returns:
+        Response: HTTP 200 with Slack's expected response payload.
+    """
+    return handler.handle(request)
+
+
+@flask_app.route("/health", methods=["GET"])
+def health_check():
+    """
+    Simple health check endpoint for Railway and uptime monitors.
+
+    Returns:
+        JSON: {"status": "ok"} with HTTP 200 to confirm the server is running.
+    """
+    return jsonify({"status": "ok"})
+
+
+# ---------------------------------------------------------------------------
 # Entry Point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    print("Bot is running!")
+    print("Bot is running in HTTP mode!")
+    print("Listening for Slack events at /slack/events")
     print("Daily standup scheduled for 9:00 AM")
     print("Auto-response monitoring enabled - will respond if you don't reply in 5 min")
     print("Calendar features: read, create, delete events with attendees")
 
-    # Start the schedule loop in a background daemon thread
+    # Start the schedule loop in a background daemon thread so it runs
+    # alongside the Flask web server without blocking
     scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
     scheduler_thread.start()
 
-    # Start the Slack Socket Mode connection — this blocks until the bot is stopped
-    SocketModeHandler(app, os.environ.get("SLACK_APP_TOKEN")).start()
+    # Railway injects a PORT environment variable — always use it in production
+    port = int(os.environ.get("PORT", 3000))
+    flask_app.run(host="0.0.0.0", port=port)
