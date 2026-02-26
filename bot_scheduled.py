@@ -168,6 +168,13 @@ def init_db() -> None:
             installed_at TEXT NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS google_tokens (
+            team_id    TEXT PRIMARY KEY,
+            token_data BLOB NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -307,14 +314,54 @@ def get_all_workspaces() -> list[tuple]:
     return rows
 
 
+def store_google_token(team_id: str, creds) -> None:
+    """
+    Save a workspace's Google Calendar OAuth token to the database.
+
+    The credentials object is serialised with pickle and stored as a blob
+    so it survives deployments without needing a file on disk per workspace.
+
+    Args:
+        team_id (str): The Slack workspace/team ID.
+        creds: A google.oauth2.credentials.Credentials object.
+    """
+    token_data = pickle.dumps(creds)
+    conn = sqlite3.connect("data/bot.db")
+    conn.execute(
+        "INSERT OR REPLACE INTO google_tokens (team_id, token_data, updated_at) VALUES (?, ?, ?)",
+        (team_id, token_data, datetime.datetime.utcnow().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_google_token(team_id: str):
+    """
+    Load the stored Google Calendar credentials for a workspace.
+
+    Args:
+        team_id (str): The Slack workspace/team ID.
+
+    Returns:
+        google.oauth2.credentials.Credentials | None: The credentials object,
+        or None if this workspace hasn't connected Google Calendar yet.
+    """
+    conn = sqlite3.connect("data/bot.db")
+    row = conn.execute(
+        "SELECT token_data FROM google_tokens WHERE team_id = ?", (team_id,)
+    ).fetchone()
+    conn.close()
+    if row:
+        return pickle.loads(row[0])
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Google Calendar Helpers
 # ---------------------------------------------------------------------------
 
-# Paths for Google credentials — stored in the Railway Volume so they
-# survive deployments
+# Path for Google credentials file — loaded from GOOGLE_CREDENTIALS_JSON env var
 CREDENTIALS_PATH = "data/credentials.json"
-TOKEN_PATH = "data/token.pickle"
 
 
 def load_google_credentials_file() -> str | None:
@@ -343,42 +390,42 @@ def load_google_credentials_file() -> str | None:
     return None
 
 
-def get_calendar_service():
+def get_calendar_service(team_id: str):
     """
-    Authenticate with Google Calendar and return an authorized service client.
+    Return an authorised Google Calendar API client for a specific workspace.
 
-    Loads the saved token from data/token.pickle (on the Railway Volume).
-    If the token is expired, refreshes it silently. If no token exists,
+    Loads the stored token for this workspace from the database. If the token
+    is expired, it is refreshed silently and saved back. If no token exists,
     returns None — the bot will prompt the user to visit /auth/google.
+
+    Args:
+        team_id (str): The Slack workspace/team ID to load credentials for.
 
     Returns:
         googleapiclient.discovery.Resource | None: Authorized Google Calendar
-        API service, or None if not yet authenticated.
+        API service for this workspace, or None if not yet authenticated.
     """
-    creds = None
+    creds = get_google_token(team_id)
 
-    # Load existing token from the persistent Volume
-    if os.path.exists(TOKEN_PATH):
-        with open(TOKEN_PATH, 'rb') as token:
-            creds = pickle.load(token)
+    if not creds:
+        return None
 
     # Refresh silently if expired
-    if creds and creds.expired and creds.refresh_token:
+    if creds.expired and creds.refresh_token:
         try:
             creds.refresh(Request())
-            with open(TOKEN_PATH, 'wb') as token:
-                pickle.dump(creds, token)
+            store_google_token(team_id, creds)
         except Exception as e:
-            print(f"Token refresh failed: {e}")
+            print(f"Token refresh failed for team {team_id}: {e}")
             return None
 
-    if not creds or not creds.valid:
+    if not creds.valid:
         return None
 
     return build('calendar', 'v3', credentials=creds)
 
 
-def get_events_for_date(days_offset: int = 0) -> str:
+def get_events_for_date(team_id: str, days_offset: int = 0) -> str:
     """
     Fetch all Google Calendar events for a given day and return them as a
     formatted string.
@@ -393,9 +440,10 @@ def get_events_for_date(days_offset: int = 0) -> str:
              if the API call fails.
     """
     try:
-        service = get_calendar_service()
+        service = get_calendar_service(team_id)
         if not service:
-            return "📅 Google Calendar not connected. Visit /auth/google to reconnect."
+            base_url = os.environ.get("BASE_URL", "").rstrip("/")
+            return f"📅 Google Calendar not connected. Visit {base_url}/auth/google?team_id={team_id} to connect."
         now = datetime.datetime.utcnow()
         target_date = now + datetime.timedelta(days=days_offset)
 
@@ -430,6 +478,7 @@ def get_events_for_date(days_offset: int = 0) -> str:
 
 
 def create_calendar_event(
+    team_id: str,
     summary: str,
     start_time: datetime.datetime,
     duration_minutes: int = 60,
@@ -450,7 +499,10 @@ def create_calendar_event(
              list of invited attendees (if any), or an error string on failure.
     """
     try:
-        service = get_calendar_service()
+        service = get_calendar_service(team_id)
+        if not service:
+            base_url = os.environ.get("BASE_URL", "").rstrip("/")
+            return f"📅 Google Calendar not connected. Visit {base_url}/auth/google?team_id={team_id} to connect."
         end_time = start_time + datetime.timedelta(minutes=duration_minutes)
 
         event = {
@@ -490,7 +542,7 @@ def create_calendar_event(
         return f"Could not create event: {str(e)}"
 
 
-def delete_calendar_event(event_title: str, days_offset: int = 0) -> str:
+def delete_calendar_event(team_id: str, event_title: str, days_offset: int = 0) -> str:
     """
     Find and delete a calendar event by partial title match on a given day.
 
@@ -507,7 +559,10 @@ def delete_calendar_event(event_title: str, days_offset: int = 0) -> str:
              events match, a not-found message, or an error string on failure.
     """
     try:
-        service = get_calendar_service()
+        service = get_calendar_service(team_id)
+        if not service:
+            base_url = os.environ.get("BASE_URL", "").rstrip("/")
+            return f"📅 Google Calendar not connected. Visit {base_url}/auth/google?team_id={team_id} to connect."
         now = datetime.datetime.utcnow()
         target_date = now + datetime.timedelta(days=days_offset)
 
@@ -744,7 +799,7 @@ def send_daily_standup() -> None:
                 continue
 
             client = WebClient(token=bot_token)
-            calendar_info = get_events_for_date(0)
+            calendar_info = get_events_for_date(team_id, 0)
             message = (
                 f"Good morning! What are you working on today?\n\n"
                 f"Your calendar:\n{calendar_info}"
@@ -800,9 +855,18 @@ def process_direct_message(event: dict, say) -> None:
     user_message_lower = user_message.lower()
 
     # Register the sender as workspace owner on their first DM to the bot
+    # and send them a welcome message with their personal Google Calendar auth link
     if team_id and not get_workspace_owner(team_id):
         set_workspace_owner(team_id, user)
         print(f"Workspace owner set: user {user} in team {team_id}")
+        base_url = os.environ.get("BASE_URL", "").rstrip("/")
+        say(
+            f"👋 Welcome! I'm your Standup Agent.\n\n"
+            f"To connect *your* Google Calendar so I can show your schedule and send daily standups, visit:\n"
+            f"{base_url}/auth/google?team_id={team_id}\n\n"
+            f"Once connected, just DM me anything!"
+        )
+        return
 
     print(f"Processing DM: {user_message[:50]}...")
 
@@ -837,7 +901,7 @@ Example: "Delete the Product Sync meeting tomorrow" -> {{"event_title": "Product
 
             if delete_details.get('event_title'):
                 days = 1 if delete_details.get('date_context') == 'tomorrow' else 0
-                result = delete_calendar_event(delete_details['event_title'], days)
+                result = delete_calendar_event(team_id, delete_details['event_title'], days)
                 say(result)
                 return
             else:
@@ -881,6 +945,7 @@ Today's date is {datetime.datetime.now().strftime('%Y-%m-%d')}"""
                 attendees = event_details.get('attendees', [])
 
                 result = create_calendar_event(
+                    team_id,
                     event_details['title'],
                     event_datetime,
                     duration,
@@ -902,7 +967,7 @@ Today's date is {datetime.datetime.now().strftime('%Y-%m-%d')}"""
         days_offset = 0
 
     if days_offset is not None:
-        calendar_info = f"\n\nCalendar information:\n{get_events_for_date(days_offset)}"
+        calendar_info = f"\n\nCalendar information:\n{get_events_for_date(team_id, days_offset)}"
 
     response = anthropic.messages.create(
         model="claude-sonnet-4-20250514",
@@ -1237,14 +1302,21 @@ def slack_events():
 @flask_app.route("/auth/google", methods=["GET"])
 def google_auth():
     """
-    Start the Google Calendar OAuth flow.
+    Start the Google Calendar OAuth flow for a specific workspace.
 
-    Redirects the user to Google's consent page. After approving,
-    Google redirects back to /auth/google/callback where the token is saved.
+    Requires a ?team_id= query parameter so the returned token is saved
+    against the correct workspace. The bot sends each new user their
+    personal link automatically on their first DM.
 
-    Visit this URL once to connect Google Calendar to the bot:
-    https://<your-railway-url>/auth/google
+    Example: https://<railway-url>/auth/google?team_id=T01ERGZJCPQ
     """
+    team_id = request.args.get("team_id")
+    if not team_id:
+        return (
+            "<h1>Error</h1>"
+            "<p>Missing team_id. Please use the link sent by the bot in Slack.</p>"
+        ), 400
+
     creds_path = load_google_credentials_file()
     if not creds_path:
         return "<h1>Error</h1><p>GOOGLE_CREDENTIALS_JSON environment variable not set in Railway.</p>", 500
@@ -1264,10 +1336,11 @@ def google_auth():
         prompt='consent'
     )
 
-    # Save state to verify it in the callback
+    # Map the OAuth state to the workspace team_id so the callback knows
+    # which workspace to save the token for
     os.makedirs("data", exist_ok=True)
-    with open("data/google_oauth_state", "w") as f:
-        f.write(state)
+    with open(f"data/google_state_{state}", "w") as f:
+        f.write(team_id)
 
     return flask_redirect(auth_url)
 
@@ -1275,10 +1348,12 @@ def google_auth():
 @flask_app.route("/auth/google/callback", methods=["GET"])
 def google_auth_callback():
     """
-    Google OAuth callback — exchanges the authorization code for a token.
+    Google OAuth callback — exchanges the code for a token and saves it
+    per-workspace in the database.
 
-    Saves the token to data/token.pickle on the Railway Volume so it
-    persists across all future deployments.
+    Looks up the team_id from the state file written during /auth/google,
+    then stores the credentials in the google_tokens table so each
+    workspace has its own independent Google Calendar connection.
     """
     error = request.args.get("error")
     if error:
@@ -1286,14 +1361,17 @@ def google_auth_callback():
 
     state = request.args.get("state")
 
-    # Verify state matches what we stored
+    # Recover the team_id associated with this OAuth state
+    state_file = f"data/google_state_{state}"
     try:
-        with open("data/google_oauth_state", "r") as f:
-            stored_state = f.read().strip()
-        if state != stored_state:
-            return "<h1>Error</h1><p>Invalid state token.</p>", 400
+        with open(state_file, "r") as f:
+            team_id = f.read().strip()
+        os.remove(state_file)
     except FileNotFoundError:
-        return "<h1>Error</h1><p>No OAuth session found. Please visit /auth/google again.</p>", 400
+        return (
+            "<h1>Error</h1>"
+            "<p>Session expired. Please use the /auth/google link from the bot again.</p>"
+        ), 400
 
     creds_path = load_google_credentials_file()
     base_url = os.environ.get("BASE_URL", "").rstrip("/")
@@ -1306,22 +1384,20 @@ def google_auth_callback():
         redirect_uri=redirect_uri
     )
 
-    # Force HTTPS in the authorization response URL (Railway uses HTTP internally)
+    # Railway reverse proxy strips HTTPS — restore it for token exchange
     auth_response = request.url.replace("http://", "https://")
     flow.fetch_token(authorization_response=auth_response)
 
-    creds = flow.credentials
-    os.makedirs("data", exist_ok=True)
-    with open(TOKEN_PATH, "wb") as token:
-        pickle.dump(creds, token)
+    # Save the token against this specific workspace
+    store_google_token(team_id, flow.credentials)
+    print(f"Google Calendar connected for workspace {team_id}")
 
-    print("Google Calendar connected successfully!")
     return """
     <html>
     <body style="font-family: sans-serif; text-align: center; padding: 60px;">
         <h1>✅ Google Calendar connected!</h1>
-        <p>Your bot can now read and manage your calendar.</p>
-        <p>You can close this tab.</p>
+        <p>Your calendar is now linked to your Standup Agent.</p>
+        <p>You can close this tab and return to Slack.</p>
     </body>
     </html>
     """
