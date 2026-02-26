@@ -12,12 +12,19 @@ Transport:
   This bot uses HTTP mode (Flask) — Slack sends events to a public webhook URL.
   This is required for Slack App Directory distribution and cloud hosting on Railway.
 
+Multi-Workspace:
+  The bot supports multiple Slack workspaces via OAuth. Any workspace can install it
+  by visiting /slack/install. Each workspace's bot token and owner are stored in a
+  local SQLite database (data/bot.db). The workspace owner is the first person to DM
+  the bot after installation — they get the standup messages and mention monitoring.
+
 Setup:
-  1. Copy .env.example to .env and fill in your credentials
+  1. Copy .env.example to .env and fill in your credentials (including SLACK_CLIENT_ID
+     and SLACK_CLIENT_SECRET from your Slack app's Basic Information page)
   2. Place your Google OAuth credentials in credentials.json
   3. Run: python3 bot_scheduled.py
-  4. On first run, a browser window will open for Google Calendar authorization
-  5. Set the Slack Event Subscriptions Request URL to: https://<your-railway-url>/slack/events
+  4. Visit https://<your-railway-url>/slack/install to install the bot in a workspace
+  5. Set the Slack OAuth Redirect URL to: https://<your-railway-url>/slack/oauth_redirect
 
 Dependencies:
   slack-bolt, flask, anthropic, google-auth, google-api-python-client, schedule, python-dotenv
@@ -26,6 +33,7 @@ Author: Kingsley Mkpandiok
 """
 
 import os
+import sqlite3
 import datetime
 import pickle
 import schedule
@@ -36,6 +44,10 @@ import json
 from flask import Flask, request, jsonify
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
+from slack_bolt.oauth.oauth_settings import OAuthSettings
+from slack_bolt.oauth.installation_store import FileInstallationStore
+from slack_bolt.oauth.state_store import FileOAuthStateStore
+from slack_sdk import WebClient
 from anthropic import Anthropic
 from dotenv import load_dotenv
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -49,11 +61,41 @@ load_dotenv()
 # App Initialization
 # ---------------------------------------------------------------------------
 
-# Slack Bolt app — authenticates using the bot token and signing secret from .env.
-# The signing secret is used to verify that incoming requests genuinely come from Slack.
+# Ensure storage directories exist before initializing the installation store.
+# These folders hold per-workspace OAuth tokens and temporary OAuth state cookies.
+os.makedirs("data/installations", exist_ok=True)
+os.makedirs("data/states", exist_ok=True)
+
+# Slack Bolt app in OAuth (multi-workspace) mode.
+# Instead of a single hardcoded bot token, each workspace that installs the app
+# gets its own token, stored via FileInstallationStore and loaded automatically
+# per request by Slack Bolt.
 app = App(
-    token=os.environ.get("SLACK_BOT_TOKEN"),
-    signing_secret=os.environ.get("SLACK_SIGNING_SECRET")
+    signing_secret=os.environ.get("SLACK_SIGNING_SECRET"),
+    oauth_settings=OAuthSettings(
+        client_id=os.environ.get("SLACK_CLIENT_ID"),
+        client_secret=os.environ.get("SLACK_CLIENT_SECRET"),
+        # Scopes the bot requests from each installing workspace
+        scopes=[
+            "app_mentions:read",   # Receive events when the bot is @mentioned
+            "channels:history",    # Read messages in public channels
+            "channels:read",       # List channels the bot is in
+            "chat:write",          # Post messages on behalf of the bot
+            "im:history",          # Read direct messages sent to the bot
+            "im:write",            # Open and send DMs
+            "users:read",          # Look up user presence and profile info
+            "search:read",         # Search Slack message history for context
+        ],
+        # FileInstallationStore saves each workspace's bot token as a JSON file
+        # under data/installations/. Add a Railway Volume to persist across deploys.
+        installation_store=FileInstallationStore(base_dir="./data/installations"),
+        # FileOAuthStateStore saves short-lived state tokens to prevent CSRF attacks
+        # during the OAuth handshake. Tokens expire after 10 minutes.
+        state_store=FileOAuthStateStore(
+            expiration_seconds=600,
+            base_dir="./data/states"
+        ),
+    )
 )
 
 # Flask web server — Slack sends all events to this server via HTTP POST
@@ -72,19 +114,97 @@ anthropic = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 # Google Calendar OAuth scopes — full access needed to create and delete events
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 
-# Slack user ID of the bot owner, auto-captured from the first DM or channel message.
-# Used to detect when the owner has responded to a mention so the auto-reply is cancelled.
-YOUR_USER_ID: str | None = None
-YOUR_SLACK_USER_ID: str | None = None
-
 # Dictionary tracking channel mentions that haven't received a reply yet.
-# Key format: "{channel_id}:{thread_ts}"
-# Value: dict with channel, thread_ts, original message text, and timestamp
+# Key format: "{team_id}:{channel_id}:{thread_ts}"
+# Value: dict with team_id, channel, thread_ts, original message text, and timestamp
 pending_mentions: dict = {}
 
 # Messages containing any of these keywords will be skipped by the auto-responder
 # to avoid the bot inadvertently weighing in on sensitive conversations.
 SENSITIVE_KEYWORDS = ['personal', 'private', 'confidential', 'sensitive', '1:1', 'one-on-one']
+
+
+# ---------------------------------------------------------------------------
+# Database — Per-Workspace Owner Storage
+# ---------------------------------------------------------------------------
+
+def init_db() -> None:
+    """
+    Initialize the SQLite database and create the workspace_owners table if it
+    doesn't already exist.
+
+    The workspace_owners table maps each Slack team (workspace) to the user who
+    first DM'd the bot after installation. That user is treated as the workspace
+    owner and receives standup messages and mention monitoring.
+
+    Should be called once at startup before the web server starts.
+    """
+    os.makedirs("data", exist_ok=True)
+    conn = sqlite3.connect("data/bot.db")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS workspace_owners (
+            team_id      TEXT PRIMARY KEY,
+            user_id      TEXT NOT NULL,
+            installed_at TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def get_workspace_owner(team_id: str) -> str | None:
+    """
+    Look up the owner user ID for a given Slack workspace.
+
+    Args:
+        team_id (str): The Slack team/workspace ID (e.g. 'T01234567').
+
+    Returns:
+        str | None: The Slack user ID of the workspace owner, or None if no
+                    owner has been recorded for this workspace yet.
+    """
+    conn = sqlite3.connect("data/bot.db")
+    row = conn.execute(
+        "SELECT user_id FROM workspace_owners WHERE team_id = ?", (team_id,)
+    ).fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def set_workspace_owner(team_id: str, user_id: str) -> None:
+    """
+    Record the owner user ID for a given Slack workspace.
+
+    Uses INSERT OR REPLACE so calling this again with a new user ID will
+    update the owner. This lets the workspace owner be reassigned if needed.
+
+    Args:
+        team_id (str): The Slack team/workspace ID.
+        user_id (str): The Slack user ID to designate as workspace owner.
+    """
+    conn = sqlite3.connect("data/bot.db")
+    conn.execute(
+        "INSERT OR REPLACE INTO workspace_owners (team_id, user_id, installed_at) VALUES (?, ?, ?)",
+        (team_id, user_id, datetime.datetime.utcnow().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_all_workspaces() -> list[tuple]:
+    """
+    Retrieve all registered workspace owners from the database.
+
+    Used by the daily standup scheduler to send morning messages to every
+    workspace that has an owner set up.
+
+    Returns:
+        list[tuple]: A list of (team_id, user_id) pairs for all workspaces.
+    """
+    conn = sqlite3.connect("data/bot.db")
+    rows = conn.execute("SELECT team_id, user_id FROM workspace_owners").fetchall()
+    conn.close()
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -309,27 +429,31 @@ def delete_calendar_event(event_title: str, days_offset: int = 0) -> str:
 # Slack Utility Helpers
 # ---------------------------------------------------------------------------
 
-def check_user_active() -> bool:
+def check_user_active(user_id: str, bot_token: str) -> bool:
     """
-    Check whether the bot owner is currently marked as 'active' on Slack.
+    Check whether a workspace owner is currently marked as 'active' on Slack.
 
     This is used by the auto-responder to skip sending a reply if the owner
     appears to be online (they may just be slow to respond).
+
+    Args:
+        user_id (str): The Slack user ID of the workspace owner to check.
+        bot_token (str): The bot token for the workspace where the check is needed.
 
     Returns:
         bool: True if the owner's Slack presence is 'active', False otherwise
               or if the presence check fails.
     """
     try:
-        if YOUR_SLACK_USER_ID:
-            response = app.client.users_getPresence(user=YOUR_SLACK_USER_ID)
-            return response['presence'] == 'active'
+        client = WebClient(token=bot_token)
+        response = client.users_getPresence(user=user_id)
+        return response['presence'] == 'active'
     except Exception as e:
         print(f"Error checking presence: {e}")
     return False
 
 
-def search_slack_history(query: str, channel_id: str) -> list:
+def search_slack_history(query: str, bot_token: str) -> list:
     """
     Search Slack message history for messages relevant to a given query.
 
@@ -338,14 +462,14 @@ def search_slack_history(query: str, channel_id: str) -> list:
 
     Args:
         query (str): The search string (typically the first 100 chars of the mention).
-        channel_id (str): The Slack channel ID (currently unused by the API call
-                          but kept for future scoped search support).
+        bot_token (str): The bot token for the workspace to search in.
 
     Returns:
         list: Up to 3 matching Slack message objects, or an empty list on failure.
     """
     try:
-        result = app.client.search_messages(query=query, count=5)
+        client = WebClient(token=bot_token)
+        result = client.search_messages(query=query, count=5)
         if result['messages']['matches']:
             return result['messages']['matches'][:3]
     except Exception as e:
@@ -357,7 +481,15 @@ def search_slack_history(query: str, channel_id: str) -> list:
 # Auto-Reply Logic
 # ---------------------------------------------------------------------------
 
-def auto_respond_to_mention(channel: str, thread_ts: str, original_message: str) -> None:
+def auto_respond_to_mention(
+    team_id: str,
+    channel: str,
+    thread_ts: str,
+    original_message: str,
+    owner_user_id: str,
+    bot_token: str,
+    owner_name: str = "the owner"
+) -> None:
     """
     Wait 5 minutes after a channel mention, then auto-reply on the owner's behalf
     if they haven't responded yet.
@@ -372,23 +504,25 @@ def auto_respond_to_mention(channel: str, thread_ts: str, original_message: str)
     context from Slack history and posts a reply in the original thread.
 
     Args:
+        team_id (str): Slack workspace/team ID, used to scope the pending_mentions key.
         channel (str): Slack channel ID where the mention occurred.
         thread_ts (str): Timestamp of the thread root message (used as thread identifier).
         original_message (str): Full text of the message that mentioned the owner.
+        owner_user_id (str): Slack user ID of the workspace owner being mentioned.
+        bot_token (str): Bot token for this workspace, used to post the auto-reply.
+        owner_name (str): Display name of the owner, used to personalise the reply.
     """
-    global YOUR_SLACK_USER_ID
-
     # Wait the full 5-minute window before doing anything
     time.sleep(300)
 
-    key = f"{channel}:{thread_ts}"
+    key = f"{team_id}:{channel}:{thread_ts}"
 
     # Bail out if the owner already responded (key removed from pending_mentions)
     if key not in pending_mentions:
         return
 
     # Bail out if the owner is now showing as active on Slack
-    if check_user_active():
+    if check_user_active(owner_user_id, bot_token):
         print(f"User is active, skipping auto-response for {key}")
         del pending_mentions[key]
         return
@@ -402,7 +536,7 @@ def auto_respond_to_mention(channel: str, thread_ts: str, original_message: str)
 
     try:
         # Search for relevant past messages to give the AI helpful context
-        search_results = search_slack_history(original_message[:100], channel)
+        search_results = search_slack_history(original_message[:100], bot_token)
 
         context = f"Someone asked: '{original_message}'\n"
         if search_results:
@@ -412,11 +546,11 @@ def auto_respond_to_mention(channel: str, thread_ts: str, original_message: str)
 
         ai_prompt = f"""{context}
 
-You are Kingsley's AI assistant. Kingsley hasn't responded yet. Provide a helpful response that:
+You are {owner_name}'s AI assistant. {owner_name} hasn't responded yet. Provide a helpful response that:
 1. Acknowledges you're the assistant
 2. Provides useful information if possible
 3. Asks clarifying questions if needed
-4. Mentions Kingsley will follow up
+4. Mentions {owner_name} will follow up
 
 Keep it brief and professional."""
 
@@ -427,19 +561,20 @@ Keep it brief and professional."""
         )
 
         reply = (
-            f"👋 Hi! I'm Kingsley's AI assistant. He hasn't responded yet, but let me help:\n\n"
+            f"👋 Hi! I'm {owner_name}'s AI assistant. They haven't responded yet, but let me help:\n\n"
             f"{response.content[0].text}\n\n"
-            f"_Kingsley will follow up when he's available._"
+            f"_{owner_name} will follow up when available._"
         )
 
-        # Post the AI reply in the same thread as the original mention
-        app.client.chat_postMessage(
+        # Post the AI reply in the same thread using this workspace's bot token
+        client = WebClient(token=bot_token)
+        client.chat_postMessage(
             channel=channel,
             thread_ts=thread_ts,
             text=reply
         )
 
-        print(f"Auto-responded to mention in {channel}")
+        print(f"Auto-responded to mention in {channel} (workspace: {team_id})")
 
     except Exception as e:
         print(f"Error in auto-response: {e}")
@@ -455,23 +590,43 @@ Keep it brief and professional."""
 
 def send_daily_standup() -> None:
     """
-    Send the daily standup prompt to the bot owner as a Slack DM.
+    Send the daily standup prompt to every registered workspace owner as a Slack DM.
 
-    Fetches today's Google Calendar events and includes them in the message
-    so the owner has full context when planning their day.
+    Iterates over all workspaces stored in the database. For each workspace, it
+    looks up the installed bot token, fetches today's Google Calendar events, and
+    sends a personalised morning message to the workspace owner.
 
     This function is registered with the `schedule` library and fires every
     day at 09:00 (in whatever timezone the host machine is set to).
     """
-    global YOUR_USER_ID
-    if YOUR_USER_ID:
+    workspaces = get_all_workspaces()
+
+    if not workspaces:
+        print("No workspaces registered yet, skipping standup.")
+        return
+
+    for team_id, user_id in workspaces:
         try:
+            # Look up the stored bot token for this workspace
+            installation = app.installation_store.find_installation(
+                enterprise_id=None,
+                team_id=team_id
+            )
+            if not installation:
+                print(f"No installation found for team {team_id}, skipping.")
+                continue
+
+            client = WebClient(token=installation.bot_token)
             calendar_info = get_events_for_date(0)
-            message = f"Good morning! What are you working on today?\n\nYour calendar:\n{calendar_info}"
-            app.client.chat_postMessage(channel=YOUR_USER_ID, text=message)
-            print(f"Daily standup sent at {datetime.datetime.now()}")
+            message = (
+                f"Good morning! What are you working on today?\n\n"
+                f"Your calendar:\n{calendar_info}"
+            )
+            client.chat_postMessage(channel=user_id, text=message)
+            print(f"Daily standup sent to {user_id} in workspace {team_id}")
+
         except Exception as e:
-            print(f"Error sending standup: {e}")
+            print(f"Error sending standup to workspace {team_id}: {e}")
 
 
 # Register the standup job — fires every day at 09:00
@@ -505,24 +660,22 @@ def process_direct_message(event: dict, say) -> None:
       3. **General query** — fetches relevant calendar context if needed, then
          passes everything to the AI for a conversational response.
 
-    Also captures the owner's Slack user ID on the first DM if it hasn't been
-    set yet.
+    Also registers the sender as the workspace owner on their first DM if no
+    owner has been recorded for this workspace yet.
 
     Args:
         event (dict): The Slack event payload for the incoming message.
         say (callable): Slack Bolt's `say` function to reply in the same channel/DM.
     """
-    global YOUR_USER_ID, YOUR_SLACK_USER_ID
-
     user = event.get('user')
+    team_id = event.get('team')
     user_message = event.get('text', '')
     user_message_lower = user_message.lower()
 
-    # Capture the owner's Slack user ID the first time they send a DM
-    if not YOUR_USER_ID:
-        YOUR_USER_ID = user
-        YOUR_SLACK_USER_ID = user
-        print(f"User ID saved from DM: {YOUR_USER_ID}")
+    # Register the sender as workspace owner on their first DM to the bot
+    if team_id and not get_workspace_owner(team_id):
+        set_workspace_owner(team_id, user)
+        print(f"Workspace owner set: user {user} in team {team_id}")
 
     print(f"Processing DM: {user_message[:50]}...")
 
@@ -720,8 +873,6 @@ def handle_message_event(event: dict, say) -> None:
         event (dict): The raw Slack event payload.
         say (callable): Slack Bolt's reply function, scoped to the event's channel.
     """
-    global YOUR_SLACK_USER_ID, YOUR_USER_ID
-
     # Ignore messages sent by bots (including this bot itself)
     if event.get('subtype') == 'bot_message':
         return
@@ -736,6 +887,7 @@ def handle_message_event(event: dict, say) -> None:
         return
 
     # --- Channel message: extract fields for mention tracking ---
+    team_id = event.get('team')
     channel = event.get('channel')
     text = event.get('text', '')
     user = event.get('user')
@@ -743,20 +895,37 @@ def handle_message_event(event: dict, say) -> None:
     # Use thread_ts if this is a reply; otherwise the message itself is the thread root
     thread_ts = event.get('thread_ts', ts)
 
-    # Auto-capture the owner's user ID from the first channel message seen
-    if not YOUR_SLACK_USER_ID and not YOUR_USER_ID:
-        YOUR_SLACK_USER_ID = user
-        YOUR_USER_ID = user
-        print(f"User ID saved from channel message: {user}")
+    # Look up the registered owner for this workspace
+    owner_user_id = get_workspace_owner(team_id) if team_id else None
+
+    # No owner registered yet — nothing to monitor
+    if not owner_user_id:
         return
 
     # If someone else mentioned the owner, start the auto-reply countdown
-    if YOUR_SLACK_USER_ID and f"<@{YOUR_SLACK_USER_ID}>" in text:
-        if user != YOUR_SLACK_USER_ID:
-            key = f"{channel}:{thread_ts}"
+    if f"<@{owner_user_id}>" in text and user != owner_user_id:
+        key = f"{team_id}:{channel}:{thread_ts}"
+
+        # Look up this workspace's bot token for posting the reply later
+        installation = app.installation_store.find_installation(
+            enterprise_id=None,
+            team_id=team_id
+        )
+        bot_token = installation.bot_token if installation else None
+
+        if bot_token:
+            # Fetch the owner's display name to personalise the auto-reply
+            try:
+                client = WebClient(token=bot_token)
+                user_info = client.users_info(user=owner_user_id)
+                owner_name = user_info['user']['profile'].get('display_name') or \
+                             user_info['user']['profile'].get('real_name', 'the owner')
+            except Exception:
+                owner_name = "the owner"
 
             # Register this mention as pending
             pending_mentions[key] = {
+                'team_id': team_id,
                 'channel': channel,
                 'thread_ts': thread_ts,
                 'message': text,
@@ -766,23 +935,56 @@ def handle_message_event(event: dict, say) -> None:
             # Spin up a daemon thread — it will wait 5 min then auto-reply if needed
             threading.Thread(
                 target=auto_respond_to_mention,
-                args=(channel, thread_ts, text),
+                args=(team_id, channel, thread_ts, text, owner_user_id, bot_token, owner_name),
                 daemon=True
             ).start()
 
-            print(f"Tracking mention in {channel}, will auto-respond in 5 min if no reply")
+            print(f"Tracking mention in {channel} (team {team_id}), auto-reply in 5 min if no response")
 
     # If the owner replied in a thread with a pending mention, cancel the auto-reply
-    if YOUR_SLACK_USER_ID and user == YOUR_SLACK_USER_ID:
-        key = f"{channel}:{thread_ts}"
+    if user == owner_user_id:
+        key = f"{team_id}:{channel}:{thread_ts}"
         if key in pending_mentions:
-            print(f"Kingsley responded, canceling auto-response for {key}")
+            print(f"Owner responded, canceling auto-response for {key}")
             del pending_mentions[key]
 
 
 # ---------------------------------------------------------------------------
 # Flask Routes
 # ---------------------------------------------------------------------------
+
+@flask_app.route("/slack/install", methods=["GET"])
+def install():
+    """
+    Entry point for the Slack OAuth installation flow.
+
+    When a user visits this URL, Slack Bolt automatically generates a unique
+    state token and redirects the user to Slack's OAuth authorization page
+    where they can review and approve the bot's requested permissions.
+
+    Returns:
+        Response: A redirect to Slack's OAuth consent screen.
+    """
+    return handler.handle(request)
+
+
+@flask_app.route("/slack/oauth_redirect", methods=["GET"])
+def oauth_redirect():
+    """
+    Callback URL that Slack redirects to after the user approves the installation.
+
+    Slack appends a one-time code to this URL. Slack Bolt exchanges that code
+    for a permanent bot token, saves the installation via FileInstallationStore,
+    and redirects the user to a success page.
+
+    This URL must be registered in your Slack app under:
+    OAuth & Permissions → Redirect URLs
+
+    Returns:
+        Response: A redirect to Slack's post-install success page.
+    """
+    return handler.handle(request)
+
 
 @flask_app.route("/slack/events", methods=["POST"])
 def slack_events():
@@ -816,8 +1018,13 @@ def health_check():
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    # Initialise the SQLite database and create tables if they don't exist yet
+    init_db()
+
     print("Bot is running in HTTP mode!")
-    print("Listening for Slack events at /slack/events")
+    print("Install URL: /slack/install")
+    print("OAuth Redirect URL: /slack/oauth_redirect")
+    print("Events endpoint: /slack/events")
     print("Daily standup scheduled for 9:00 AM")
     print("Auto-response monitoring enabled - will respond if you don't reply in 5 min")
     print("Calendar features: read, create, delete events with attendees")
