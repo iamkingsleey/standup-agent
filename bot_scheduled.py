@@ -75,6 +75,10 @@ app = App(
     oauth_settings=OAuthSettings(
         client_id=os.environ.get("SLACK_CLIENT_ID"),
         client_secret=os.environ.get("SLACK_CLIENT_SECRET"),
+        # Explicit redirect URI — must match exactly what is registered in
+        # the Slack app's OAuth & Permissions → Redirect URLs section.
+        # Set SLACK_REDIRECT_URI in Railway environment variables.
+        redirect_uri=os.environ.get("SLACK_REDIRECT_URI"),
         # Scopes the bot requests from each installing workspace
         scopes=[
             "app_mentions:read",   # Receive events when the bot is @mentioned
