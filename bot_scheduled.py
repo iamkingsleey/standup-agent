@@ -34,6 +34,7 @@ Author: Kingsley Mkpandiok
 
 import os
 import sqlite3
+import secrets
 import datetime
 import pickle
 import schedule
@@ -41,12 +42,10 @@ import time
 import threading
 import json
 
-from flask import Flask, request, jsonify
+import requests as http_requests
+from flask import Flask, request, jsonify, redirect as flask_redirect
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
-from slack_bolt.oauth.oauth_settings import OAuthSettings
-from slack_sdk.oauth.installation_store import FileInstallationStore
-from slack_sdk.oauth.state_store import FileOAuthStateStore
 from slack_sdk import WebClient
 from anthropic import Anthropic
 from dotenv import load_dotenv
@@ -61,44 +60,37 @@ load_dotenv()
 # App Initialization
 # ---------------------------------------------------------------------------
 
-# Ensure storage directories exist before initializing the installation store.
-# These folders hold per-workspace OAuth tokens and temporary OAuth state cookies.
-os.makedirs("data/installations", exist_ok=True)
-os.makedirs("data/states", exist_ok=True)
+def authorize(enterprise_id, team_id, logger):
+    """
+    Bolt authorize callback — looks up the bot token for the requesting workspace.
 
-# Slack Bolt app in OAuth (multi-workspace) mode.
-# Instead of a single hardcoded bot token, each workspace that installs the app
-# gets its own token, stored via FileInstallationStore and loaded automatically
-# per request by Slack Bolt.
+    Slack Bolt calls this on every incoming event to get the correct bot token
+    for the workspace that sent the event. We look it up from our SQLite database
+    where it was stored during the OAuth installation flow.
+
+    Args:
+        enterprise_id: Enterprise Grid ID (None for standard workspaces).
+        team_id (str): The Slack workspace/team ID.
+        logger: Bolt's built-in logger.
+
+    Returns:
+        dict: A dict containing 'bot_token' for the workspace.
+
+    Raises:
+        Exception: If no installation is found for the workspace.
+    """
+    token = get_installation_token(team_id)
+    if token:
+        return {"bot_token": token}
+    raise Exception(f"No installation found for team {team_id}")
+
+
+# Slack Bolt app using a manual authorize callback instead of OAuthSettings.
+# This bypasses Bolt's built-in OAuth machinery entirely, giving us full
+# control over the installation flow and token storage.
 app = App(
     signing_secret=os.environ.get("SLACK_SIGNING_SECRET"),
-    oauth_settings=OAuthSettings(
-        client_id=os.environ.get("SLACK_CLIENT_ID"),
-        client_secret=os.environ.get("SLACK_CLIENT_SECRET"),
-        # Explicit redirect URI — must match exactly what is registered in
-        # the Slack app's OAuth & Permissions → Redirect URLs section.
-        # Set SLACK_REDIRECT_URI in Railway environment variables.
-        redirect_uri=os.environ.get("SLACK_REDIRECT_URI"),
-        # Scopes the bot requests from each installing workspace
-        scopes=[
-            "app_mentions:read",   # Receive events when the bot is @mentioned
-            "channels:history",    # Read messages in public channels
-            "channels:read",       # List channels the bot is in
-            "chat:write",          # Post messages on behalf of the bot
-            "im:history",          # Read direct messages sent to the bot
-            "im:write",            # Open and send DMs
-            "users:read",          # Look up user presence and profile info
-        ],
-        # FileInstallationStore saves each workspace's bot token as a JSON file
-        # under data/installations/. Add a Railway Volume to persist across deploys.
-        installation_store=FileInstallationStore(base_dir="./data/installations"),
-        # FileOAuthStateStore saves short-lived state tokens to prevent CSRF attacks
-        # during the OAuth handshake. Tokens expire after 10 minutes.
-        state_store=FileOAuthStateStore(
-            expiration_seconds=600,
-            base_dir="./data/states"
-        ),
-    )
+    authorize=authorize,
 )
 
 # Flask web server — Slack sends all events to this server via HTTP POST
@@ -133,17 +125,32 @@ SENSITIVE_KEYWORDS = ['personal', 'private', 'confidential', 'sensitive', '1:1',
 
 def init_db() -> None:
     """
-    Initialize the SQLite database and create the workspace_owners table if it
-    doesn't already exist.
+    Initialize the SQLite database and create all required tables.
 
-    The workspace_owners table maps each Slack team (workspace) to the user who
-    first DM'd the bot after installation. That user is treated as the workspace
-    owner and receives standup messages and mention monitoring.
+    Tables created:
+      - installations: stores bot tokens per workspace, populated during OAuth.
+      - oauth_states: short-lived CSRF state tokens used during the OAuth handshake.
+      - workspace_owners: maps each workspace to the user who first DM'd the bot.
 
     Should be called once at startup before the web server starts.
     """
     os.makedirs("data", exist_ok=True)
     conn = sqlite3.connect("data/bot.db")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS installations (
+            team_id      TEXT PRIMARY KEY,
+            team_name    TEXT,
+            bot_token    TEXT NOT NULL,
+            bot_user_id  TEXT,
+            installed_at TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS oauth_states (
+            state      TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL
+        )
+    """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS workspace_owners (
             team_id      TEXT PRIMARY KEY,
@@ -153,6 +160,86 @@ def init_db() -> None:
     """)
     conn.commit()
     conn.close()
+
+
+def store_oauth_state(state: str) -> None:
+    """
+    Persist a short-lived OAuth state token to the database.
+
+    The state token is generated during /slack/install and verified when
+    Slack redirects back to /slack/oauth_redirect. It prevents CSRF attacks
+    by ensuring the redirect came from our own install page.
+
+    Args:
+        state (str): A cryptographically random URL-safe string.
+    """
+    conn = sqlite3.connect("data/bot.db")
+    conn.execute(
+        "INSERT OR REPLACE INTO oauth_states (state, created_at) VALUES (?, ?)",
+        (state, datetime.datetime.utcnow().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+
+def verify_and_consume_state(state: str) -> bool:
+    """
+    Verify a state token exists and delete it so it cannot be reused.
+
+    Args:
+        state (str): The state value received from Slack's redirect.
+
+    Returns:
+        bool: True if the state was found and deleted, False if not found.
+    """
+    conn = sqlite3.connect("data/bot.db")
+    row = conn.execute(
+        "SELECT state FROM oauth_states WHERE state = ?", (state,)
+    ).fetchone()
+    if row:
+        conn.execute("DELETE FROM oauth_states WHERE state = ?", (state,))
+        conn.commit()
+    conn.close()
+    return row is not None
+
+
+def store_installation(team_id: str, team_name: str, bot_token: str, bot_user_id: str) -> None:
+    """
+    Save a workspace's bot token after a successful OAuth installation.
+
+    Args:
+        team_id (str): Slack workspace/team ID.
+        team_name (str): Human-readable workspace name.
+        bot_token (str): The bot's OAuth access token (starts with xoxb-).
+        bot_user_id (str): The Slack user ID of the bot itself in this workspace.
+    """
+    conn = sqlite3.connect("data/bot.db")
+    conn.execute(
+        """INSERT OR REPLACE INTO installations
+           (team_id, team_name, bot_token, bot_user_id, installed_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (team_id, team_name, bot_token, bot_user_id, datetime.datetime.utcnow().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_installation_token(team_id: str) -> str | None:
+    """
+    Retrieve the stored bot token for a given workspace.
+
+    Args:
+        team_id (str): Slack workspace/team ID.
+
+    Returns:
+        str | None: The bot token, or None if not installed.
+    """
+    conn = sqlite3.connect("data/bot.db")
+    row = conn.execute(
+        "SELECT bot_token FROM installations WHERE team_id = ?", (team_id,)
+    ).fetchone()
+    conn.close()
+    return row[0] if row else None
 
 
 def get_workspace_owner(team_id: str) -> str | None:
@@ -611,15 +698,12 @@ def send_daily_standup() -> None:
     for team_id, user_id in workspaces:
         try:
             # Look up the stored bot token for this workspace
-            installation = app.installation_store.find_installation(
-                enterprise_id=None,
-                team_id=team_id
-            )
-            if not installation:
+            bot_token = get_installation_token(team_id)
+            if not bot_token:
                 print(f"No installation found for team {team_id}, skipping.")
                 continue
 
-            client = WebClient(token=installation.bot_token)
+            client = WebClient(token=bot_token)
             calendar_info = get_events_for_date(0)
             message = (
                 f"Good morning! What are you working on today?\n\n"
@@ -910,11 +994,7 @@ def handle_message_event(event: dict, say) -> None:
         key = f"{team_id}:{channel}:{thread_ts}"
 
         # Look up this workspace's bot token for posting the reply later
-        installation = app.installation_store.find_installation(
-            enterprise_id=None,
-            team_id=team_id
-        )
-        bot_token = installation.bot_token if installation else None
+        bot_token = get_installation_token(team_id)
 
         if bot_token:
             # Fetch the owner's display name to personalise the auto-reply
@@ -961,14 +1041,35 @@ def install():
     """
     Entry point for the Slack OAuth installation flow.
 
-    When a user visits this URL, Slack Bolt automatically generates a unique
-    state token and redirects the user to Slack's OAuth authorization page
-    where they can review and approve the bot's requested permissions.
+    Generates a cryptographically random state token (stored in SQLite to
+    prevent CSRF attacks), then redirects the user to Slack's OAuth consent
+    page with the required scopes and our redirect URI.
 
     Returns:
-        Response: A redirect to Slack's OAuth consent screen.
+        Response: A redirect to Slack's OAuth authorization page.
     """
-    return handler.handle(request)
+    state = secrets.token_urlsafe(32)
+    store_oauth_state(state)
+
+    scopes = ",".join([
+        "app_mentions:read",
+        "channels:history",
+        "channels:read",
+        "chat:write",
+        "im:history",
+        "im:write",
+        "users:read",
+    ])
+
+    auth_url = (
+        "https://slack.com/oauth/v2/authorize"
+        f"?client_id={os.environ.get('SLACK_CLIENT_ID')}"
+        f"&scope={scopes}"
+        f"&redirect_uri={os.environ.get('SLACK_REDIRECT_URI')}"
+        f"&state={state}"
+    )
+
+    return flask_redirect(auth_url)
 
 
 @flask_app.route("/slack/oauth_redirect", methods=["GET"])
@@ -976,17 +1077,73 @@ def oauth_redirect():
     """
     Callback URL that Slack redirects to after the user approves the installation.
 
-    Slack appends a one-time code to this URL. Slack Bolt exchanges that code
-    for a permanent bot token, saves the installation via FileInstallationStore,
-    and redirects the user to a success page.
+    Manually exchanges the one-time authorization code for a permanent bot token
+    by calling Slack's oauth.v2.access API directly via HTTP POST. Stores the
+    token in SQLite and returns a success page to the user.
 
     This URL must be registered in your Slack app under:
     OAuth & Permissions → Redirect URLs
 
     Returns:
-        Response: A redirect to Slack's post-install success page.
+        Response: An HTML success or error page.
     """
-    return handler.handle(request)
+    error = request.args.get('error')
+    if error:
+        print(f"OAuth error from Slack: {error}")
+        return f"<h1>Installation cancelled</h1><p>Reason: {error}</p>", 400
+
+    code = request.args.get('code')
+    state = request.args.get('state')
+
+    if not code:
+        return "<h1>Error</h1><p>No authorization code received from Slack.</p>", 400
+
+    # Verify the state token to prevent CSRF attacks
+    if not state or not verify_and_consume_state(state):
+        print(f"Invalid or expired state token: {state}")
+        return "<h1>Error</h1><p>Invalid state token. Please try installing again.</p>", 400
+
+    # Exchange the authorization code for a bot token directly via HTTP POST.
+    # This bypasses Bolt's internal OAuth handler to avoid reverse-proxy URL issues.
+    response = http_requests.post(
+        "https://slack.com/api/oauth.v2.access",
+        data={
+            "code": code,
+            "client_id": os.environ.get("SLACK_CLIENT_ID"),
+            "client_secret": os.environ.get("SLACK_CLIENT_SECRET"),
+            "redirect_uri": os.environ.get("SLACK_REDIRECT_URI"),
+        },
+        timeout=10
+    )
+
+    data = response.json()
+    print(f"OAuth exchange response: ok={data.get('ok')}, error={data.get('error')}")
+
+    if not data.get("ok"):
+        return (
+            f"<h1>Installation failed</h1>"
+            f"<p>Slack returned an error: <strong>{data.get('error')}</strong></p>"
+            f"<p>Please <a href='/slack/install'>try again</a>.</p>"
+        ), 400
+
+    # Store the installation details in our database
+    team_id = data["team"]["id"]
+    team_name = data["team"]["name"]
+    bot_token = data["access_token"]
+    bot_user_id = data.get("bot_user_id", "")
+
+    store_installation(team_id, team_name, bot_token, bot_user_id)
+    print(f"Successfully installed in workspace: {team_name} ({team_id})")
+
+    return """
+    <html>
+    <body style="font-family: sans-serif; text-align: center; padding: 60px;">
+        <h1>✅ Standup Agent installed!</h1>
+        <p>The bot has been successfully added to <strong>{}</strong>.</p>
+        <p>Send it a DM in Slack to get started.</p>
+    </body>
+    </html>
+    """.format(team_name)
 
 
 @flask_app.route("/slack/events", methods=["POST"])
