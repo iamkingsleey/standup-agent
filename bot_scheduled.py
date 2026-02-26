@@ -1330,6 +1330,16 @@ def google_auth():
     redirect_uri = f"{base_url}/auth/google/callback"
     print(f"Google OAuth redirect_uri: {redirect_uri}")
 
+    # Debug: log which client ID is being used
+    try:
+        import json as _json
+        with open(creds_path) as _f:
+            _creds = _json.load(_f)
+        _client_id = list(_creds.values())[0].get("client_id", "unknown")
+        print(f"Google OAuth client_id: {_client_id}")
+    except Exception:
+        pass
+
     flow = Flow.from_client_secrets_file(
         creds_path,
         scopes=SCOPES,
