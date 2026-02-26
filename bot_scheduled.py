@@ -1859,6 +1859,38 @@ def summarize_thread(channel_id: str, thread_ts: str, bot_token: str) -> str:
 # Timezone Intelligence
 # ---------------------------------------------------------------------------
 
+TIMEZONE_ABBREVIATIONS: dict[str, str] = {
+    "EST": "America/New_York",   "EDT": "America/New_York",
+    "CST": "America/Chicago",    "CDT": "America/Chicago",
+    "MST": "America/Denver",     "MDT": "America/Denver",
+    "PST": "America/Los_Angeles","PDT": "America/Los_Angeles",
+    "GMT": "Europe/London",      "BST": "Europe/London",
+    "CET": "Europe/Paris",       "CEST": "Europe/Paris",
+    "EET": "Europe/Helsinki",    "EEST": "Europe/Helsinki",
+    "IST": "Asia/Kolkata",
+    "JST": "Asia/Tokyo",         "KST": "Asia/Seoul",
+    "CST8": "Asia/Shanghai",     "HKT": "Asia/Hong_Kong",
+    "SGT": "Asia/Singapore",     "AEST": "Australia/Sydney",
+    "AEDT": "Australia/Sydney",  "NZST": "Pacific/Auckland",
+    "WAT": "Africa/Lagos",       "CAT": "Africa/Harare",
+    "EAT": "Africa/Nairobi",     "SAST": "Africa/Johannesburg",
+    "UTC": "UTC",                "Z": "UTC",
+}
+
+TIME_MENTION_PATTERN = re.compile(
+    r'\b(\d{1,2}):?(\d{2})?\s*(am|pm|AM|PM)?\s*'
+    r'(UTC|GMT|EST|EDT|CST|CDT|MST|MDT|PST|PDT|BST|CET|CEST|EET|EEST|'
+    r'IST|JST|KST|SGT|HKT|AEST|AEDT|NZST|WAT|CAT|EAT|SAST|Z)\b',
+    re.IGNORECASE,
+)
+
+CHANNEL_SUMMARY_PATTERN = re.compile(
+    r'(?:summarize|summary|what(?:\'s| is)(?: happening| going on)?'
+    r'|catch me up|recap|tldr|what did i miss)'
+    r'.*?(?:<#([A-Z0-9]+)(?:\|[^>]+)?>|#(\w[\w-]*))',
+    re.IGNORECASE,
+)
+
 def detect_and_convert_times(text: str, user_timezone: str) -> str | None:
     """
     Detect time+timezone mentions in text and convert them to the user's timezone.
