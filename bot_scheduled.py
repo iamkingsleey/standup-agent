@@ -212,13 +212,43 @@ def init_db() -> None:
             installed_at TEXT NOT NULL
         )
     """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS google_tokens (
-            team_id    TEXT PRIMARY KEY,
-            token_data BLOB NOT NULL,
-            updated_at TEXT NOT NULL
-        )
-    """)
+    # --- google_tokens: migrate from per-workspace to per-user if needed ---
+    cursor = conn.execute("PRAGMA table_info(google_tokens)")
+    existing_columns = [row[1] for row in cursor.fetchall()]
+
+    if existing_columns and 'user_id' not in existing_columns:
+        # Old schema (team_id PRIMARY KEY) — rename and recreate
+        conn.execute("ALTER TABLE google_tokens RENAME TO google_tokens_v1")
+        conn.execute("""
+            CREATE TABLE google_tokens (
+                team_id    TEXT NOT NULL,
+                user_id    TEXT NOT NULL DEFAULT '',
+                token_data BLOB NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (team_id, user_id)
+            )
+        """)
+        # Migrate old rows — assign them to the workspace owner so the existing
+        # calendar connection is preserved for the person who originally set it up
+        conn.execute("""
+            INSERT INTO google_tokens (team_id, user_id, token_data, updated_at)
+            SELECT g.team_id, COALESCE(w.user_id, ''), g.token_data, g.updated_at
+            FROM google_tokens_v1 g
+            LEFT JOIN workspace_owners w ON g.team_id = w.team_id
+        """)
+        conn.execute("DROP TABLE google_tokens_v1")
+        print("Migrated google_tokens table to per-user schema.")
+    elif not existing_columns:
+        # Fresh install — create with the new schema from the start
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS google_tokens (
+                team_id    TEXT NOT NULL,
+                user_id    TEXT NOT NULL DEFAULT '',
+                token_data BLOB NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (team_id, user_id)
+            )
+        """)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS user_timezones (
             team_id    TEXT NOT NULL,
@@ -406,41 +436,44 @@ def set_user_timezone(team_id: str, user_id: str, timezone: str) -> None:
     conn.close()
 
 
-def store_google_token(team_id: str, creds) -> None:
+def store_google_token(team_id: str, user_id: str, creds) -> None:
     """
-    Save a workspace's Google Calendar OAuth token to the database.
+    Save a user's Google Calendar OAuth token to the database.
 
     The credentials object is serialised with pickle and stored as a blob
-    so it survives deployments without needing a file on disk per workspace.
+    so it survives deployments without needing a file on disk per user.
 
     Args:
         team_id (str): The Slack workspace/team ID.
+        user_id (str): The Slack user ID (individual user within the workspace).
         creds: A google.oauth2.credentials.Credentials object.
     """
     token_data = pickle.dumps(creds)
     conn = sqlite3.connect("data/bot.db")
     conn.execute(
-        "INSERT OR REPLACE INTO google_tokens (team_id, token_data, updated_at) VALUES (?, ?, ?)",
-        (team_id, token_data, datetime.datetime.utcnow().isoformat())
+        "INSERT OR REPLACE INTO google_tokens (team_id, user_id, token_data, updated_at) VALUES (?, ?, ?, ?)",
+        (team_id, user_id, token_data, datetime.datetime.utcnow().isoformat())
     )
     conn.commit()
     conn.close()
 
 
-def get_google_token(team_id: str):
+def get_google_token(team_id: str, user_id: str):
     """
-    Load the stored Google Calendar credentials for a workspace.
+    Load the stored Google Calendar credentials for a specific user.
 
     Args:
         team_id (str): The Slack workspace/team ID.
+        user_id (str): The Slack user ID.
 
     Returns:
         google.oauth2.credentials.Credentials | None: The credentials object,
-        or None if this workspace hasn't connected Google Calendar yet.
+        or None if this user hasn't connected Google Calendar yet.
     """
     conn = sqlite3.connect("data/bot.db")
     row = conn.execute(
-        "SELECT token_data FROM google_tokens WHERE team_id = ?", (team_id,)
+        "SELECT token_data FROM google_tokens WHERE team_id = ? AND user_id = ?",
+        (team_id, user_id)
     ).fetchone()
     conn.close()
     if row:
@@ -482,22 +515,23 @@ def load_google_credentials_file() -> str | None:
     return None
 
 
-def get_calendar_service(team_id: str):
+def get_calendar_service(team_id: str, user_id: str):
     """
-    Return an authorised Google Calendar API client for a specific workspace.
+    Return an authorised Google Calendar API client for a specific user.
 
-    Loads the stored token for this workspace from the database. If the token
-    is expired, it is refreshed silently and saved back. If no token exists,
-    returns None — the bot will prompt the user to visit /auth/google.
+    Loads the stored token for this (team_id, user_id) pair from the database.
+    If the token is expired, it is refreshed silently and saved back. If no
+    token exists, returns None — the bot will prompt the user to visit /auth/google.
 
     Args:
-        team_id (str): The Slack workspace/team ID to load credentials for.
+        team_id (str): The Slack workspace/team ID.
+        user_id (str): The Slack user ID (individual user within the workspace).
 
     Returns:
         googleapiclient.discovery.Resource | None: Authorized Google Calendar
-        API service for this workspace, or None if not yet authenticated.
+        API service for this user, or None if not yet authenticated.
     """
-    creds = get_google_token(team_id)
+    creds = get_google_token(team_id, user_id)
 
     if not creds:
         return None
@@ -506,9 +540,9 @@ def get_calendar_service(team_id: str):
     if creds.expired and creds.refresh_token:
         try:
             creds.refresh(Request())
-            store_google_token(team_id, creds)
+            store_google_token(team_id, user_id, creds)
         except Exception as e:
-            print(f"Token refresh failed for team {team_id}: {e}")
+            print(f"Token refresh failed for user {user_id} in team {team_id}: {e}")
             return None
 
     if not creds.valid:
@@ -517,12 +551,33 @@ def get_calendar_service(team_id: str):
     return build('calendar', 'v3', credentials=creds)
 
 
-def get_events_for_date(team_id: str, days_offset: int = 0) -> str:
+def build_calendar_auth_link(team_id: str, user_id: str) -> str:
+    """
+    Build the personalised Google Calendar OAuth link for a user.
+
+    The link is derived from SLACK_REDIRECT_URI so it always points to the
+    correct Railway URL without needing a separate BASE_URL variable.
+
+    Args:
+        team_id (str): Slack workspace/team ID.
+        user_id (str): Slack user ID.
+
+    Returns:
+        str: Full URL the user should visit to connect their Google Calendar.
+    """
+    slack_redirect = os.environ.get("SLACK_REDIRECT_URI", "")
+    base_url = slack_redirect.rsplit("/slack/oauth_redirect", 1)[0]
+    return f"{base_url}/auth/google?team_id={team_id}&user_id={user_id}"
+
+
+def get_events_for_date(team_id: str, user_id: str, days_offset: int = 0) -> str:
     """
     Fetch all Google Calendar events for a given day and return them as a
     formatted string.
 
     Args:
+        team_id (str): The Slack workspace/team ID.
+        user_id (str): The Slack user ID whose calendar to query.
         days_offset (int): Number of days from today.
                            0 = today, 1 = tomorrow, 2 = day after, etc.
 
@@ -532,10 +587,10 @@ def get_events_for_date(team_id: str, days_offset: int = 0) -> str:
              if the API call fails.
     """
     try:
-        service = get_calendar_service(team_id)
+        service = get_calendar_service(team_id, user_id)
         if not service:
-            base_url = os.environ.get("BASE_URL", "").rstrip("/")
-            return f"📅 Google Calendar not connected. Visit {base_url}/auth/google?team_id={team_id} to connect."
+            auth_link = build_calendar_auth_link(team_id, user_id)
+            return f"📅 Google Calendar not connected. Visit {auth_link} to connect."
         now = datetime.datetime.utcnow()
         target_date = now + datetime.timedelta(days=days_offset)
 
@@ -571,6 +626,7 @@ def get_events_for_date(team_id: str, days_offset: int = 0) -> str:
 
 def create_calendar_event(
     team_id: str,
+    user_id: str,
     summary: str,
     start_time: datetime.datetime,
     duration_minutes: int = 60,
@@ -580,6 +636,8 @@ def create_calendar_event(
     Create a new Google Calendar event and optionally invite attendees.
 
     Args:
+        team_id (str): The Slack workspace/team ID.
+        user_id (str): The Slack user ID whose calendar to create the event in.
         summary (str): Title/name of the event.
         start_time (datetime.datetime): Event start time (naive datetime, assumed Africa/Lagos).
         duration_minutes (int): Length of the event in minutes. Defaults to 60.
@@ -591,10 +649,10 @@ def create_calendar_event(
              list of invited attendees (if any), or an error string on failure.
     """
     try:
-        service = get_calendar_service(team_id)
+        service = get_calendar_service(team_id, user_id)
         if not service:
-            base_url = os.environ.get("BASE_URL", "").rstrip("/")
-            return f"📅 Google Calendar not connected. Visit {base_url}/auth/google?team_id={team_id} to connect."
+            auth_link = build_calendar_auth_link(team_id, user_id)
+            return f"📅 Google Calendar not connected. Visit {auth_link} to connect."
         end_time = start_time + datetime.timedelta(minutes=duration_minutes)
 
         event = {
@@ -634,7 +692,7 @@ def create_calendar_event(
         return f"Could not create event: {str(e)}"
 
 
-def delete_calendar_event(team_id: str, event_title: str, days_offset: int = 0) -> str:
+def delete_calendar_event(team_id: str, user_id: str, event_title: str, days_offset: int = 0) -> str:
     """
     Find and delete a calendar event by partial title match on a given day.
 
@@ -643,6 +701,8 @@ def delete_calendar_event(team_id: str, event_title: str, days_offset: int = 0) 
     to be more specific rather than deleting all of them.
 
     Args:
+        team_id (str): The Slack workspace/team ID.
+        user_id (str): The Slack user ID whose calendar to search.
         event_title (str): Partial or full title of the event to delete.
         days_offset (int): 0 = today, 1 = tomorrow, etc. Defaults to 0.
 
@@ -651,10 +711,10 @@ def delete_calendar_event(team_id: str, event_title: str, days_offset: int = 0) 
              events match, a not-found message, or an error string on failure.
     """
     try:
-        service = get_calendar_service(team_id)
+        service = get_calendar_service(team_id, user_id)
         if not service:
-            base_url = os.environ.get("BASE_URL", "").rstrip("/")
-            return f"📅 Google Calendar not connected. Visit {base_url}/auth/google?team_id={team_id} to connect."
+            auth_link = build_calendar_auth_link(team_id, user_id)
+            return f"📅 Google Calendar not connected. Visit {auth_link} to connect."
         now = datetime.datetime.utcnow()
         target_date = now + datetime.timedelta(days=days_offset)
 
@@ -1171,7 +1231,7 @@ def send_daily_standup() -> None:
                 continue
 
             client = WebClient(token=bot_token)
-            calendar_info = get_events_for_date(team_id, 0)
+            calendar_info = get_events_for_date(team_id, user_id, 0)
             message = (
                 f"Good morning! What are you working on today?\n\n"
                 f"Your calendar:\n{calendar_info}"
@@ -1226,19 +1286,24 @@ def process_direct_message(event: dict, say) -> None:
     user_message = event.get('text', '')
     user_message_lower = user_message.lower()
 
-    # Register the sender as workspace owner on their first DM to the bot
-    # and send them a welcome message with their personal Google Calendar auth link
+    # Register the sender as workspace owner on their very first DM
     if team_id and not get_workspace_owner(team_id):
         set_workspace_owner(team_id, user)
         print(f"Workspace owner set: user {user} in team {team_id}")
-        base_url = os.environ.get("BASE_URL", "").rstrip("/")
+
+    # If this user hasn't connected their Google Calendar yet, prompt them.
+    # We do this for every user (not just the workspace owner) so anyone who
+    # DMs the bot can get full calendar features.
+    if team_id and user and not get_google_token(team_id, user):
+        auth_link = build_calendar_auth_link(team_id, user)
         say(
             f"👋 Welcome! I'm your Standup Agent.\n\n"
-            f"To connect *your* Google Calendar so I can show your schedule and send daily standups, visit:\n"
-            f"{base_url}/auth/google?team_id={team_id}\n\n"
-            f"Once connected, just DM me anything!"
+            f"To unlock calendar features (daily standup, scheduling, and more), "
+            f"connect *your* Google Calendar:\n"
+            f"{auth_link}\n\n"
+            f"You can still chat with me without connecting — just DM me anything!"
         )
-        return
+        # Don't return — still process the message so the bot responds normally
 
     print(f"Processing DM: {user_message[:50]}...")
 
@@ -1313,7 +1378,7 @@ Example: "Delete the Product Sync meeting tomorrow" -> {{"event_title": "Product
 
             if delete_details.get('event_title'):
                 days = 1 if delete_details.get('date_context') == 'tomorrow' else 0
-                result = delete_calendar_event(team_id, delete_details['event_title'], days)
+                result = delete_calendar_event(team_id, user, delete_details['event_title'], days)
                 say(result)
                 return
             else:
@@ -1358,6 +1423,7 @@ Today's date is {datetime.datetime.now().strftime('%Y-%m-%d')}"""
 
                 result = create_calendar_event(
                     team_id,
+                    user,
                     event_details['title'],
                     event_datetime,
                     duration,
@@ -1379,7 +1445,7 @@ Today's date is {datetime.datetime.now().strftime('%Y-%m-%d')}"""
         days_offset = 0
 
     if days_offset is not None:
-        calendar_info = f"\n\nCalendar information:\n{get_events_for_date(team_id, days_offset)}"
+        calendar_info = f"\n\nCalendar information:\n{get_events_for_date(team_id, user, days_offset)}"
 
     # Build messages with conversation history for multi-turn context
     history = get_user_history(team_id, user)
@@ -1823,19 +1889,21 @@ def slack_events():
 @flask_app.route("/auth/google", methods=["GET"])
 def google_auth():
     """
-    Start the Google Calendar OAuth flow for a specific workspace.
+    Start the Google Calendar OAuth flow for a specific user.
 
-    Requires a ?team_id= query parameter so the returned token is saved
-    against the correct workspace. The bot sends each new user their
-    personal link automatically on their first DM.
+    Requires both ?team_id= and ?user_id= query parameters so the returned
+    token is saved against the correct individual user within a workspace.
+    The bot sends each user their unique personal link automatically on their
+    first DM so every team member can connect their own calendar.
 
-    Example: https://<railway-url>/auth/google?team_id=T01ERGZJCPQ
+    Example: https://<railway-url>/auth/google?team_id=T01ERGZJCPQ&user_id=U01ABCDEF
     """
     team_id = request.args.get("team_id")
-    if not team_id:
+    user_id = request.args.get("user_id")
+    if not team_id or not user_id:
         return (
             "<h1>Error</h1>"
-            "<p>Missing team_id. Please use the link sent by the bot in Slack.</p>"
+            "<p>Missing team_id or user_id. Please use the link sent by the bot in Slack.</p>"
         ), 400
 
     creds_path = load_google_credentials_file()
@@ -1860,11 +1928,11 @@ def google_auth():
         prompt='consent'
     )
 
-    # Map the OAuth state to the workspace team_id so the callback knows
-    # which workspace to save the token for
+    # Map the OAuth state to both team_id and user_id so the callback knows
+    # exactly which user to save the token for
     os.makedirs("data", exist_ok=True)
     with open(f"data/google_state_{state}", "w") as f:
-        f.write(team_id)
+        f.write(f"{team_id}:{user_id}")
 
     return flask_redirect(auth_url)
 
@@ -1873,11 +1941,11 @@ def google_auth():
 def google_auth_callback():
     """
     Google OAuth callback — exchanges the code for a token and saves it
-    per-workspace in the database.
+    per-user in the database.
 
-    Looks up the team_id from the state file written during /auth/google,
-    then stores the credentials in the google_tokens table so each
-    workspace has its own independent Google Calendar connection.
+    Looks up the team_id and user_id from the state file written during
+    /auth/google, then stores the credentials in the google_tokens table so
+    each individual user has their own independent Google Calendar connection.
     """
     error = request.args.get("error")
     if error:
@@ -1885,12 +1953,19 @@ def google_auth_callback():
 
     state = request.args.get("state")
 
-    # Recover the team_id associated with this OAuth state
+    # Recover the team_id:user_id pair associated with this OAuth state
     state_file = f"data/google_state_{state}"
     try:
         with open(state_file, "r") as f:
-            team_id = f.read().strip()
+            state_data = f.read().strip()
         os.remove(state_file)
+        # State file now stores "team_id:user_id"
+        if ":" in state_data:
+            team_id, user_id = state_data.split(":", 1)
+        else:
+            # Legacy format (just team_id) — fall back gracefully
+            team_id = state_data
+            user_id = get_workspace_owner(team_id) or ""
     except FileNotFoundError:
         return (
             "<h1>Error</h1>"
@@ -1913,15 +1988,15 @@ def google_auth_callback():
     auth_response = request.url.replace("http://", "https://")
     flow.fetch_token(authorization_response=auth_response)
 
-    # Save the token against this specific workspace
-    store_google_token(team_id, flow.credentials)
-    print(f"Google Calendar connected for workspace {team_id}")
+    # Save the token against this specific user (not just the workspace)
+    store_google_token(team_id, user_id, flow.credentials)
+    print(f"Google Calendar connected for user {user_id} in workspace {team_id}")
 
     return """
     <html>
     <body style="font-family: sans-serif; text-align: center; padding: 60px;">
         <h1>✅ Google Calendar connected!</h1>
-        <p>Your calendar is now linked to your Standup Agent.</p>
+        <p>Your personal calendar is now linked to your Standup Agent.</p>
         <p>You can close this tab and return to Slack.</p>
     </body>
     </html>
