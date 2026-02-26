@@ -119,6 +119,11 @@ SCOPES = ['https://www.googleapis.com/auth/calendar']
 # Value: dict with team_id, channel, thread_ts, original message text, and timestamp
 pending_mentions: dict = {}
 
+# Cache of recently processed Slack event IDs to prevent duplicate processing.
+# Slack retries events if it doesn't get a response within 3 seconds — this
+# ensures we never process the same event twice even if Slack resends it.
+processed_event_ids: set = set()
+
 # Messages containing any of these keywords will be skipped by the auto-responder
 # to avoid the bot inadvertently weighing in on sensitive conversations.
 SENSITIVE_KEYWORDS = ['personal', 'private', 'confidential', 'sensitive', '1:1', 'one-on-one']
@@ -1171,6 +1176,19 @@ def slack_events():
     # Ignore Slack's automatic retries to prevent duplicate processing
     if request.headers.get("X-Slack-Retry-Num"):
         return jsonify({"status": "ok"}), 200
+
+    # Deduplicate events using Slack's unique event_id.
+    # Slack may deliver the same event multiple times if our response is slow.
+    # We track processed IDs in memory and silently drop duplicates.
+    payload = request.get_json(silent=True) or {}
+    event_id = payload.get("event_id")
+    if event_id:
+        if event_id in processed_event_ids:
+            return jsonify({"status": "ok"}), 200
+        processed_event_ids.add(event_id)
+        # Prevent unbounded memory growth — clear cache after 1000 events
+        if len(processed_event_ids) > 1000:
+            processed_event_ids.clear()
 
     return handler.handle(request)
 
