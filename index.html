@@ -33,7 +33,8 @@
       align-items: center;
       justify-content: space-between;
     }
-    .nav-logo { color: #fff; font-weight: 700; font-size: 1.1rem; text-decoration: none; }
+    .nav-logo { color: #fff; font-weight: 700; font-size: 1.1rem; text-decoration: none; display: flex; align-items: center; gap: 10px; }
+    .nav-logo img { width: 32px; height: 32px; border-radius: 8px; }
     .nav-links { display: flex; gap: 24px; }
     .nav-links a {
       color: #a5b4fc;
@@ -220,7 +221,7 @@
 
 <!-- NAV -->
 <nav>
-  <a class="nav-logo" href="#">🤖 Standup Agent</a>
+  <a class="nav-logo" href="#"><img src="StandupAgent_logo.png" alt="Standup Agent logo" /> Standup Agent</a>
   <div class="nav-links">
     <a href="#features">Features</a>
     <a href="#how-it-works">How it works</a>
@@ -231,6 +232,7 @@
 
 <!-- HERO -->
 <section class="hero">
+  <img src="StandupAgent_logo.png" alt="Standup Agent" style="width:90px;height:90px;border-radius:20px;margin-bottom:24px;box-shadow:0 8px 32px rgba(0,0,0,0.3);" />
   <div class="hero-badge">✨ Open Source · Free to self-host</div>
   <h1>Your AI chief of staff,<br /><span>right inside Slack</span></h1>
   <p>Daily standups, Google Calendar, Jira tickets, long-term memory, and proactive intelligence — all from your Slack DMs. No new apps. No context switching.</p>
