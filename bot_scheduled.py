@@ -189,9 +189,9 @@ def get_my_jira_issues(assignee_email: str | None = None) -> str:
     )
 
     try:
-        # Atlassian deprecated GET /rest/api/3/search — use the POST endpoint instead
+        # Use Atlassian's current POST-based JQL search endpoint
         resp = http_requests.post(
-            f"{JIRA_BASE_URL}/rest/api/3/issue/search",
+            f"{JIRA_BASE_URL}/rest/api/3/search/jql",
             headers=jira_headers(),
             json={"jql": jql, "maxResults": 10,
                   "fields": ["summary", "status", "priority", "issuetype", "project"]},
