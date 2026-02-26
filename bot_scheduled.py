@@ -1161,9 +1161,17 @@ def slack_events():
     verifies the request signature and dispatches it to the correct
     Slack Bolt event handler above.
 
+    Slack retries failed events up to 3 times with the X-Slack-Retry-Num
+    header. We immediately acknowledge retries with 200 to prevent the bot
+    from processing the same message multiple times after coming back online.
+
     Returns:
         Response: HTTP 200 with Slack's expected response payload.
     """
+    # Ignore Slack's automatic retries to prevent duplicate processing
+    if request.headers.get("X-Slack-Retry-Num"):
+        return jsonify({"status": "ok"}), 200
+
     return handler.handle(request)
 
 
