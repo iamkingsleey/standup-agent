@@ -1321,7 +1321,14 @@ def google_auth():
     if not creds_path:
         return "<h1>Error</h1><p>GOOGLE_CREDENTIALS_JSON environment variable not set in Railway.</p>", 500
 
-    redirect_uri = os.environ.get("GOOGLE_REDIRECT_URI", "").strip()
+    # Derive the base URL from SLACK_REDIRECT_URI which is already confirmed
+    # working in Railway — avoids needing a separate GOOGLE_REDIRECT_URI variable.
+    # e.g. https://worker-production-bb20.up.railway.app/slack/oauth_redirect
+    #   -> https://worker-production-bb20.up.railway.app/auth/google/callback
+    slack_redirect = os.environ.get("SLACK_REDIRECT_URI", "")
+    base_url = slack_redirect.rsplit("/slack/oauth_redirect", 1)[0]
+    redirect_uri = f"{base_url}/auth/google/callback"
+    print(f"Google OAuth redirect_uri: {redirect_uri}")
 
     flow = Flow.from_client_secrets_file(
         creds_path,
@@ -1372,7 +1379,9 @@ def google_auth_callback():
         ), 400
 
     creds_path = load_google_credentials_file()
-    redirect_uri = os.environ.get("GOOGLE_REDIRECT_URI", "").strip()
+    slack_redirect = os.environ.get("SLACK_REDIRECT_URI", "")
+    base_url = slack_redirect.rsplit("/slack/oauth_redirect", 1)[0]
+    redirect_uri = f"{base_url}/auth/google/callback"
 
     flow = Flow.from_client_secrets_file(
         creds_path,
