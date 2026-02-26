@@ -45,8 +45,8 @@ from flask import Flask, request, jsonify
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
 from slack_bolt.oauth.oauth_settings import OAuthSettings
-from slack_bolt.oauth.installation_store import FileInstallationStore
-from slack_bolt.oauth.state_store import FileOAuthStateStore
+from slack_sdk.oauth.installation_store import FileInstallationStore
+from slack_sdk.oauth.state_store import FileOAuthStateStore
 from slack_sdk import WebClient
 from anthropic import Anthropic
 from dotenv import load_dotenv
