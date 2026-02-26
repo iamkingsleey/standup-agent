@@ -50,7 +50,7 @@ from slack_bolt.authorization import AuthorizeResult
 from slack_sdk import WebClient
 from anthropic import Anthropic
 from dotenv import load_dotenv
-from google_auth_oauthlib.flow import InstalledAppFlow
+from google_auth_oauthlib.flow import InstalledAppFlow, Flow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 
@@ -311,41 +311,69 @@ def get_all_workspaces() -> list[tuple]:
 # Google Calendar Helpers
 # ---------------------------------------------------------------------------
 
+# Paths for Google credentials — stored in the Railway Volume so they
+# survive deployments
+CREDENTIALS_PATH = "data/credentials.json"
+TOKEN_PATH = "data/token.pickle"
+
+
+def load_google_credentials_file() -> str | None:
+    """
+    Ensure credentials.json is available on disk.
+
+    On Railway, the file content is stored in the GOOGLE_CREDENTIALS_JSON
+    environment variable and written to the data/ Volume directory on startup.
+    Locally, the file is read directly from credentials.json.
+
+    Returns:
+        str | None: Path to the credentials file, or None if not found.
+    """
+    # Write from env var if available (Railway production)
+    creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+    if creds_json:
+        os.makedirs("data", exist_ok=True)
+        with open(CREDENTIALS_PATH, 'w') as f:
+            f.write(creds_json)
+        return CREDENTIALS_PATH
+
+    # Fall back to local file for development
+    if os.path.exists('credentials.json'):
+        return 'credentials.json'
+
+    return None
+
+
 def get_calendar_service():
     """
     Authenticate with Google Calendar and return an authorized service client.
 
-    On first run (or after deleting token.pickle), this opens a browser window
-    for OAuth authorization. On subsequent runs it loads the saved token and
-    refreshes it automatically if expired.
+    Loads the saved token from data/token.pickle (on the Railway Volume).
+    If the token is expired, refreshes it silently. If no token exists,
+    returns None — the bot will prompt the user to visit /auth/google.
 
     Returns:
-        googleapiclient.discovery.Resource: Authorized Google Calendar API service.
-
-    Raises:
-        FileNotFoundError: If credentials.json is missing.
-        google.auth.exceptions.RefreshError: If the refresh token has been revoked.
+        googleapiclient.discovery.Resource | None: Authorized Google Calendar
+        API service, or None if not yet authenticated.
     """
     creds = None
 
-    # Load existing credentials from disk if available
-    if os.path.exists('token.pickle'):
-        with open('token.pickle', 'rb') as token:
+    # Load existing token from the persistent Volume
+    if os.path.exists(TOKEN_PATH):
+        with open(TOKEN_PATH, 'rb') as token:
             creds = pickle.load(token)
 
-    # If there are no valid credentials, refresh or re-authenticate
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            # Silently refresh the access token using the refresh token
+    # Refresh silently if expired
+    if creds and creds.expired and creds.refresh_token:
+        try:
             creds.refresh(Request())
-        else:
-            # First-time auth: open browser for user consent
-            flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
-            creds = flow.run_local_server(port=0)
+            with open(TOKEN_PATH, 'wb') as token:
+                pickle.dump(creds, token)
+        except Exception as e:
+            print(f"Token refresh failed: {e}")
+            return None
 
-        # Persist the new/refreshed credentials for future runs
-        with open('token.pickle', 'wb') as token:
-            pickle.dump(creds, token)
+    if not creds or not creds.valid:
+        return None
 
     return build('calendar', 'v3', credentials=creds)
 
@@ -366,6 +394,8 @@ def get_events_for_date(days_offset: int = 0) -> str:
     """
     try:
         service = get_calendar_service()
+        if not service:
+            return "📅 Google Calendar not connected. Visit /auth/google to reconnect."
         now = datetime.datetime.utcnow()
         target_date = now + datetime.timedelta(days=days_offset)
 
@@ -1202,6 +1232,99 @@ def slack_events():
         pass
 
     return handler.handle(request)
+
+
+@flask_app.route("/auth/google", methods=["GET"])
+def google_auth():
+    """
+    Start the Google Calendar OAuth flow.
+
+    Redirects the user to Google's consent page. After approving,
+    Google redirects back to /auth/google/callback where the token is saved.
+
+    Visit this URL once to connect Google Calendar to the bot:
+    https://<your-railway-url>/auth/google
+    """
+    creds_path = load_google_credentials_file()
+    if not creds_path:
+        return "<h1>Error</h1><p>GOOGLE_CREDENTIALS_JSON environment variable not set in Railway.</p>", 500
+
+    base_url = os.environ.get("BASE_URL", "").rstrip("/")
+    redirect_uri = f"{base_url}/auth/google/callback"
+
+    flow = Flow.from_client_secrets_file(
+        creds_path,
+        scopes=SCOPES,
+        redirect_uri=redirect_uri
+    )
+
+    auth_url, state = flow.authorization_url(
+        access_type='offline',
+        include_granted_scopes='true',
+        prompt='consent'
+    )
+
+    # Save state to verify it in the callback
+    os.makedirs("data", exist_ok=True)
+    with open("data/google_oauth_state", "w") as f:
+        f.write(state)
+
+    return flask_redirect(auth_url)
+
+
+@flask_app.route("/auth/google/callback", methods=["GET"])
+def google_auth_callback():
+    """
+    Google OAuth callback — exchanges the authorization code for a token.
+
+    Saves the token to data/token.pickle on the Railway Volume so it
+    persists across all future deployments.
+    """
+    error = request.args.get("error")
+    if error:
+        return f"<h1>Authorization failed</h1><p>{error}</p>", 400
+
+    state = request.args.get("state")
+
+    # Verify state matches what we stored
+    try:
+        with open("data/google_oauth_state", "r") as f:
+            stored_state = f.read().strip()
+        if state != stored_state:
+            return "<h1>Error</h1><p>Invalid state token.</p>", 400
+    except FileNotFoundError:
+        return "<h1>Error</h1><p>No OAuth session found. Please visit /auth/google again.</p>", 400
+
+    creds_path = load_google_credentials_file()
+    base_url = os.environ.get("BASE_URL", "").rstrip("/")
+    redirect_uri = f"{base_url}/auth/google/callback"
+
+    flow = Flow.from_client_secrets_file(
+        creds_path,
+        scopes=SCOPES,
+        state=state,
+        redirect_uri=redirect_uri
+    )
+
+    # Force HTTPS in the authorization response URL (Railway uses HTTP internally)
+    auth_response = request.url.replace("http://", "https://")
+    flow.fetch_token(authorization_response=auth_response)
+
+    creds = flow.credentials
+    os.makedirs("data", exist_ok=True)
+    with open(TOKEN_PATH, "wb") as token:
+        pickle.dump(creds, token)
+
+    print("Google Calendar connected successfully!")
+    return """
+    <html>
+    <body style="font-family: sans-serif; text-align: center; padding: 60px;">
+        <h1>✅ Google Calendar connected!</h1>
+        <p>Your bot can now read and manage your calendar.</p>
+        <p>You can close this tab.</p>
+    </body>
+    </html>
+    """
 
 
 @flask_app.route("/health", methods=["GET"])
