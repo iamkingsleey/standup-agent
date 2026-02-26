@@ -3,7 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Open Source](https://img.shields.io/badge/Open%20Source-%E2%9D%A4-brightgreen)](https://github.com/iamkingsleey/standup-agent)
 
-A smart, open-source Slack bot that acts as your personal AI assistant — powered by Claude (Anthropic) and integrated with Google Calendar. It sends you a daily standup prompt, answers questions, manages your calendar, monitors channel mentions, and summarizes conversations, all from your Slack DMs.
+A smart, open-source Slack bot that acts as your personal AI assistant — powered by Claude (Anthropic) and integrated with Google Calendar. It sends you a daily standup prompt, answers questions, manages your calendar, monitors channel mentions, summarizes conversations, remembers your work context, and proactively keeps you on top of your day — all from your Slack DMs.
 
 Deployable to any cloud host. This project uses [Railway](https://railway.app) for production.
 
@@ -12,7 +12,7 @@ Deployable to any cloud host. This project uses [Railway](https://railway.app) f
 ## Features
 
 ### 📅 Daily Standup
-Every morning at 9:00 AM the bot DMs you with a "What are you working on today?" prompt alongside your Google Calendar events for the day. Works for every user who connects their own calendar.
+Every morning at 9:00 AM the bot DMs you with a "What are you working on today?" prompt alongside your Google Calendar events for the day. It also includes any conflict warnings (back-to-back or overlapping meetings) and a list of tasks carried over from yesterday. Works for every user who connects their own calendar.
 
 ### 🗓️ Google Calendar Integration (Per-User)
 Each Slack user connects their own personal Google Calendar. The bot can:
@@ -21,22 +21,57 @@ Each Slack user connects their own personal Google Calendar. The bot can:
 - Delete events ("cancel the product sync today")
 - Invite attendees by email when creating events
 
+### 🧠 Long-term Memory
+The bot remembers things about you across sessions — current projects, teammates, deadlines, tools you use, and preferences. After every conversation, it quietly extracts key facts and stores them, then injects that context into every future reply so it always knows who it's talking to.
+
+Try asking:
+- *"What do you know about me?"*
+- *"What was I working on last week?"*
+- *"Show me my work history this month"*
+
+### 📋 Action Item Tracker
+When you reply to the morning standup, the bot automatically extracts your tasks for the day and tracks them. At 5 PM it checks back in: *"Here's what you said this morning — how'd it go?"*
+
+Try asking:
+- *"What are my tasks?"*
+- *"What are my pending action items?"*
+- Reply *"done"* at end of day to mark everything complete
+
+### 🤖 Proactive Intelligence
+
+**Pre-meeting briefings** — About 10 minutes before every calendar event, the bot DMs you a personalised prep pack: who's attending, the meeting agenda, and any relevant pending tasks. No setup required — it fires automatically.
+
+**End-of-day follow-up** — At 5 PM, if you have pending action items from the day's standup, the bot checks in and asks how you got on.
+
+**Weekly retrospective** — Every Friday at 5 PM, the bot auto-generates a personalised summary of your week based on your standup history, covering wins, recurring themes, blockers, and suggested focus for next week.
+
+**Conflict detection** — The morning standup automatically flags back-to-back meetings or overlapping events on your calendar so you can fix them before the day starts.
+
+### 🤖 Autonomous Scheduling
+The bot can find free time and block your calendar without you having to open it.
+
+Try asking:
+- *"Find a time with sarah@company.com this week"* → bot checks your calendar and presents 3 available slots, then reply *"book option 2"* to confirm
+- *"When am I free for a 30 minute call tomorrow?"*
+- *"Block 2 hours of focus time"* → finds your next free window and creates a Focus Time calendar event
+- *"Protect 3 hours for deep work this week"*
+
 ### 💬 Context-Aware AI Replies
-DM the bot anything. It remembers the last 10 messages in your conversation so it can answer follow-up questions with full context. Powered by Claude.
+DM the bot anything. It remembers the last 10 messages in your conversation for follow-up questions, and combines that with your long-term memory for truly personalised replies. Powered by Claude.
 
 ### 📋 Channel & Thread Summarization
-- **DM command:** "summarize #dev-team" or "what happened in #general" — the bot fetches the last 24 hours of messages and returns a structured summary with key topics, decisions, action items, and open questions.
+- **DM command:** "summarize #dev-team" or "what happened in #general" — fetches the last 24 hours and returns a structured summary with key topics, decisions, action items, and open questions.
 - **Slash command:** `/summarize` in any channel or thread for an instant summary.
 - **Auto-summary:** When a Slack thread hits 10+ replies, the bot automatically posts a summary inside the thread.
 
 ### 🕒 Timezone Intelligence
-The bot detects time + timezone mentions in messages (e.g. "3 PM PST", "14:30 UTC") and converts them to your local timezone. It also flags times that fall outside standard business hours. Set your timezone with: "my timezone is WAT" or "set timezone to America/New_York".
+The bot detects time + timezone mentions in messages (e.g. "3 PM PST", "14:30 UTC") and converts them to your local timezone. It also flags times outside standard business hours. Set your timezone with: *"my timezone is WAT"* or *"set timezone to America/New_York"*.
 
 ### 👀 Mention Monitoring & Auto-Reply
 If someone @mentions you in a channel and you don't respond within 5 minutes, the bot automatically replies on your behalf with a helpful AI-generated response. It skips auto-replies if you're showing as active on Slack or the message contains sensitive keywords.
 
 ### 🌐 Multi-Workspace Support
-The bot supports multiple Slack workspaces simultaneously. Each workspace installs the bot via OAuth, and each individual user within a workspace can connect their own Google Calendar.
+The bot supports multiple Slack workspaces simultaneously. Each workspace installs the bot via OAuth, and each individual user within a workspace can connect their own Google Calendar and get their own personalised experience.
 
 ---
 
@@ -170,9 +205,15 @@ Click it, approve Google's permissions, and your calendar is linked. Every user 
 | "what do I have tomorrow?" | Lists tomorrow's events |
 | "schedule a team sync tomorrow at 3pm" | Creates a Google Calendar event |
 | "cancel the product review today" | Deletes a matching event |
+| "find a time with X this week" | Finds 3 free slots and offers to book |
+| "book option 2" | Books the chosen slot from find-a-time |
+| "block 2 hours of focus time" | Auto-creates a Focus Time calendar event |
+| "what are my tasks?" | Lists all pending action items |
+| "done" | Marks today's action items as complete |
+| "what was I working on last week?" | Shows standup history |
 | "summarize #engineering" | Summarizes the last 24h of a channel |
 | "my timezone is EST" | Sets your timezone for time conversions |
-| Anything else | Conversational AI reply with calendar context |
+| Anything else | Conversational AI reply with full memory context |
 
 ### Slash command
 
@@ -180,6 +221,15 @@ Click it, approve Google's permissions, and your calendar is linked. Every user 
 /summarize             — summarize current thread or channel (last 24h)
 /summarize #channel    — summarize a specific channel
 ```
+
+### Automatic proactive messages
+
+| When | What the bot sends |
+|---|---|
+| 9:00 AM daily | Morning standup with calendar, conflict warnings, and carryover tasks |
+| ~10 min before each meeting | Pre-meeting briefing with attendees, agenda, and pending tasks |
+| 5:00 PM daily | End-of-day check-in on today's action items |
+| Every Friday 5:00 PM | Weekly retrospective based on your standup history |
 
 ---
 
@@ -194,6 +244,11 @@ The bot uses a single SQLite file at `data/bot.db` with these tables:
 | `workspace_owners` | Maps each workspace to its first DM user (gets daily standups) |
 | `google_tokens` | Per-user Google Calendar OAuth tokens `(team_id, user_id)` |
 | `user_timezones` | Per-user timezone preferences |
+| `standup_responses` | Daily standup replies per user for history and retros |
+| `standup_sent` | Tracks which users received today's standup (for reply detection) |
+| `action_items` | Tasks extracted from standups with pending/done/dismissed status |
+| `user_memories` | Long-term key-value facts per user (projects, preferences, colleagues) |
+| `briefings_sent` | Tracks which meeting briefings have been sent (prevents duplicates) |
 
 ---
 
@@ -217,6 +272,8 @@ The bot uses a single SQLite file at `data/bot.db` with these tables:
 - **No Bolt OAuth** — the Slack OAuth install flow is handled manually via Flask routes to avoid conflicts with Railway's reverse proxy and URL rewriting.
 - **Retry deduplication** — Slack retries events that don't get a < 3s response. The bot immediately returns 200 on retried requests (`X-Slack-Retry-Num` header) and deduplicates by `event_id` as a second layer.
 - **Per-user calendar tokens** — Google OAuth tokens are stored with a `(team_id, user_id)` composite key so every Slack user in every workspace has their own independent calendar connection.
+- **Async background tasks** — memory extraction and action item parsing run in background daemon threads after each reply so they never slow down the user-facing response.
+- **Proactive scheduler** — all proactive features (briefings, EOD follow-up, weekly retro) run in a single background scheduler thread using the `schedule` library, checked every 60 seconds.
 
 ---
 
