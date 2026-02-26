@@ -1,0 +1,373 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Standup Agent — AI-powered standups, calendar & Jira for Slack</title>
+  <meta name="description" content="Standup Agent is your personal AI chief of staff for Slack. Daily standups, Google Calendar, Jira integration, long-term memory, and proactive intelligence — all from your DMs." />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --brand: #4f46e5;
+      --brand-light: #ede9fe;
+      --brand-dark: #1a1a2e;
+      --text: #111827;
+      --muted: #6b7280;
+      --border: #e5e7eb;
+      --bg: #f9fafb;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+    }
+
+    /* NAV */
+    nav {
+      background: var(--brand-dark);
+      padding: 16px 32px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .nav-logo { color: #fff; font-weight: 700; font-size: 1.1rem; text-decoration: none; }
+    .nav-links { display: flex; gap: 24px; }
+    .nav-links a {
+      color: #a5b4fc;
+      text-decoration: none;
+      font-size: 0.9rem;
+      transition: color .2s;
+    }
+    .nav-links a:hover { color: #fff; }
+
+    /* HERO */
+    .hero {
+      background: linear-gradient(135deg, var(--brand-dark) 0%, #312e81 100%);
+      color: #fff;
+      text-align: center;
+      padding: 96px 24px 80px;
+    }
+    .hero-badge {
+      display: inline-block;
+      background: rgba(255,255,255,.12);
+      border: 1px solid rgba(255,255,255,.2);
+      border-radius: 99px;
+      padding: 4px 16px;
+      font-size: 0.82rem;
+      letter-spacing: .04em;
+      margin-bottom: 24px;
+      color: #c7d2fe;
+    }
+    .hero h1 {
+      font-size: clamp(2rem, 5vw, 3.2rem);
+      font-weight: 800;
+      line-height: 1.15;
+      margin-bottom: 20px;
+    }
+    .hero h1 span { color: #a5b4fc; }
+    .hero p {
+      font-size: 1.15rem;
+      color: #c7d2fe;
+      max-width: 600px;
+      margin: 0 auto 40px;
+    }
+    .btn-add-slack {
+      display: inline-flex;
+      align-items: center;
+      gap: 12px;
+      background: #fff;
+      color: var(--brand-dark);
+      font-weight: 700;
+      font-size: 1rem;
+      padding: 14px 28px;
+      border-radius: 8px;
+      text-decoration: none;
+      transition: transform .15s, box-shadow .15s;
+      box-shadow: 0 4px 20px rgba(0,0,0,.25);
+    }
+    .btn-add-slack:hover { transform: translateY(-2px); box-shadow: 0 8px 28px rgba(0,0,0,.3); }
+    .btn-add-slack svg { flex-shrink: 0; }
+    .hero-sub {
+      margin-top: 20px;
+      font-size: 0.82rem;
+      color: rgba(255,255,255,.45);
+    }
+
+    /* FEATURES STRIP */
+    .strip {
+      background: var(--brand);
+      padding: 18px 32px;
+      overflow: hidden;
+    }
+    .strip-inner {
+      display: flex;
+      gap: 40px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+    .strip-item {
+      color: #e0e7ff;
+      font-size: 0.875rem;
+      font-weight: 500;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    /* FEATURES GRID */
+    .section { max-width: 1100px; margin: 0 auto; padding: 80px 24px; }
+    .section-label {
+      text-align: center;
+      font-size: 0.8rem;
+      font-weight: 700;
+      letter-spacing: .1em;
+      color: var(--brand);
+      text-transform: uppercase;
+      margin-bottom: 12px;
+    }
+    .section h2 {
+      text-align: center;
+      font-size: clamp(1.5rem, 3vw, 2.2rem);
+      font-weight: 800;
+      margin-bottom: 56px;
+      color: var(--brand-dark);
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 24px;
+    }
+    .card {
+      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 32px;
+      box-shadow: 0 1px 3px rgba(0,0,0,.06);
+      transition: box-shadow .2s, transform .2s;
+    }
+    .card:hover { box-shadow: 0 6px 24px rgba(0,0,0,.1); transform: translateY(-2px); }
+    .card-icon { font-size: 2rem; margin-bottom: 14px; }
+    .card h3 { font-size: 1.05rem; font-weight: 700; margin-bottom: 10px; color: var(--brand-dark); }
+    .card p { font-size: 0.9rem; color: var(--muted); line-height: 1.65; }
+
+    /* HOW IT WORKS */
+    .how { background: var(--brand-light); }
+    .how .section { padding: 80px 24px; }
+    .steps {
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+      max-width: 600px;
+      margin: 0 auto;
+    }
+    .step {
+      display: flex;
+      gap: 20px;
+      align-items: flex-start;
+      padding: 24px 0;
+      border-bottom: 1px solid #ddd6fe;
+    }
+    .step:last-child { border-bottom: none; }
+    .step-num {
+      background: var(--brand);
+      color: #fff;
+      font-weight: 800;
+      font-size: 0.9rem;
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      margin-top: 2px;
+    }
+    .step h4 { font-size: 1rem; font-weight: 700; margin-bottom: 4px; color: var(--brand-dark); }
+    .step p { font-size: 0.88rem; color: #5b21b6; }
+
+    /* CTA */
+    .cta {
+      background: linear-gradient(135deg, var(--brand-dark) 0%, #312e81 100%);
+      text-align: center;
+      padding: 80px 24px;
+      color: #fff;
+    }
+    .cta h2 { font-size: clamp(1.5rem, 3vw, 2rem); font-weight: 800; margin-bottom: 16px; }
+    .cta p { color: #c7d2fe; margin-bottom: 36px; font-size: 1rem; }
+
+    /* FOOTER */
+    footer {
+      background: var(--brand-dark);
+      color: #6b7280;
+      text-align: center;
+      padding: 28px 24px;
+      font-size: 0.82rem;
+    }
+    footer a { color: #a5b4fc; text-decoration: none; }
+    footer a:hover { text-decoration: underline; }
+
+    @media (max-width: 600px) {
+      nav { padding: 14px 20px; }
+      .nav-links { display: none; }
+      .strip-inner { gap: 20px; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- NAV -->
+<nav>
+  <a class="nav-logo" href="#">🤖 Standup Agent</a>
+  <div class="nav-links">
+    <a href="#features">Features</a>
+    <a href="#how-it-works">How it works</a>
+    <a href="https://github.com/iamkingsleey/standup-agent" target="_blank" rel="noopener">GitHub</a>
+    <a href="privacy-policy.html">Privacy Policy</a>
+  </div>
+</nav>
+
+<!-- HERO -->
+<section class="hero">
+  <div class="hero-badge">✨ Open Source · Free to self-host</div>
+  <h1>Your AI chief of staff,<br /><span>right inside Slack</span></h1>
+  <p>Daily standups, Google Calendar, Jira tickets, long-term memory, and proactive intelligence — all from your Slack DMs. No new apps. No context switching.</p>
+  <a class="btn-add-slack" href="https://worker-production-bb20.up.railway.app/slack/install">
+    <!-- Slack logo -->
+    <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 122.8 122.8">
+      <path d="M25.8 77.6c0 7.1-5.8 12.9-12.9 12.9S0 84.7 0 77.6s5.8-12.9 12.9-12.9h12.9v12.9zm6.5 0c0-7.1 5.8-12.9 12.9-12.9s12.9 5.8 12.9 12.9v32.3c0 7.1-5.8 12.9-12.9 12.9s-12.9-5.8-12.9-12.9V77.6z" fill="#e01e5a"/>
+      <path d="M45.2 25.8c-7.1 0-12.9-5.8-12.9-12.9S38.1 0 45.2 0s12.9 5.8 12.9 12.9v12.9H45.2zm0 6.5c7.1 0 12.9 5.8 12.9 12.9s-5.8 12.9-12.9 12.9H12.9C5.8 58.1 0 52.3 0 45.2s5.8-12.9 12.9-12.9h32.3z" fill="#36c5f0"/>
+      <path d="M97 45.2c0-7.1 5.8-12.9 12.9-12.9s12.9 5.8 12.9 12.9-5.8 12.9-12.9 12.9H97V45.2zm-6.5 0c0 7.1-5.8 12.9-12.9 12.9s-12.9-5.8-12.9-12.9V12.9C64.7 5.8 70.5 0 77.6 0s12.9 5.8 12.9 12.9v32.3z" fill="#2eb67d"/>
+      <path d="M77.6 97c7.1 0 12.9 5.8 12.9 12.9s-5.8 12.9-12.9 12.9-12.9-5.8-12.9-12.9V97h12.9zm0-6.5c-7.1 0-12.9-5.8-12.9-12.9s5.8-12.9 12.9-12.9h32.3c7.1 0 12.9 5.8 12.9 12.9s-5.8 12.9-12.9 12.9H77.6z" fill="#ecb22e"/>
+    </svg>
+    Add to Slack
+  </a>
+  <p class="hero-sub">Free · Open source · Self-hostable on Railway</p>
+</section>
+
+<!-- STRIP -->
+<div class="strip">
+  <div class="strip-inner">
+    <div class="strip-item">📅 Daily Standups</div>
+    <div class="strip-item">🗓️ Google Calendar</div>
+    <div class="strip-item">🎫 Jira Integration</div>
+    <div class="strip-item">🧠 Long-term Memory</div>
+    <div class="strip-item">🤖 Proactive Briefings</div>
+    <div class="strip-item">📋 Action Item Tracking</div>
+  </div>
+</div>
+
+<!-- FEATURES -->
+<div id="features">
+  <div class="section">
+    <p class="section-label">Features</p>
+    <h2>Everything you need to run your workday</h2>
+    <div class="grid">
+
+      <div class="card">
+        <div class="card-icon">📅</div>
+        <h3>Daily Standup</h3>
+        <p>Every morning at 9 AM, the bot DMs you a personalised briefing with your calendar, conflict warnings, Jira tickets, and tasks carried over from yesterday.</p>
+      </div>
+
+      <div class="card">
+        <div class="card-icon">🗓️</div>
+        <h3>Google Calendar</h3>
+        <p>Schedule events, cancel meetings, find free time, and block focus time — all in plain English from your Slack DMs. Every user connects their own calendar.</p>
+      </div>
+
+      <div class="card">
+        <div class="card-icon">🎫</div>
+        <h3>Jira Integration</h3>
+        <p>View assigned tickets, create bugs and stories, update issue status, and check sprint progress — without ever leaving Slack.</p>
+      </div>
+
+      <div class="card">
+        <div class="card-icon">🧠</div>
+        <h3>Long-term Memory</h3>
+        <p>The bot remembers your projects, teammates, deadlines, and preferences across sessions. Every reply is personalised to your actual work context.</p>
+      </div>
+
+      <div class="card">
+        <div class="card-icon">🤖</div>
+        <h3>Proactive Intelligence</h3>
+        <p>Get pre-meeting briefings 10 minutes before every calendar event, end-of-day action item check-ins, and weekly retrospectives every Friday.</p>
+      </div>
+
+      <div class="card">
+        <div class="card-icon">💬</div>
+        <h3>Channel Summarisation</h3>
+        <p>Missed a busy channel? Ask "summarise #dev-team" and get a structured summary of the last 24 hours — key topics, decisions, and action items.</p>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<!-- HOW IT WORKS -->
+<div class="how" id="how-it-works">
+  <div class="section">
+    <p class="section-label">How it works</p>
+    <h2>Up and running in minutes</h2>
+    <div class="steps">
+      <div class="step">
+        <div class="step-num">1</div>
+        <div>
+          <h4>Add to Slack</h4>
+          <p>Click "Add to Slack" and install the bot in your workspace via OAuth. Takes 30 seconds.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">2</div>
+        <div>
+          <h4>Connect Google Calendar</h4>
+          <p>The bot DMs you a personal calendar link. Click it, approve permissions, and your calendar is linked. Every team member can connect their own.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">3</div>
+        <div>
+          <h4>Connect Jira (optional)</h4>
+          <p>Add your Jira credentials in settings, then DM the bot your Atlassian email. Your open tickets appear in every morning standup.</p>
+        </div>
+      </div>
+      <div class="step">
+        <div class="step-num">4</div>
+        <div>
+          <h4>Start your day smarter</h4>
+          <p>At 9 AM your personalised standup arrives automatically. DM the bot anything — it knows your work context and responds accordingly.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- CTA -->
+<section class="cta">
+  <h2>Ready to run your day from Slack?</h2>
+  <p>Free, open source, and takes less than 2 minutes to install.</p>
+  <a class="btn-add-slack" href="https://worker-production-bb20.up.railway.app/slack/install">
+    <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 122.8 122.8">
+      <path d="M25.8 77.6c0 7.1-5.8 12.9-12.9 12.9S0 84.7 0 77.6s5.8-12.9 12.9-12.9h12.9v12.9zm6.5 0c0-7.1 5.8-12.9 12.9-12.9s12.9 5.8 12.9 12.9v32.3c0 7.1-5.8 12.9-12.9 12.9s-12.9-5.8-12.9-12.9V77.6z" fill="#e01e5a"/>
+      <path d="M45.2 25.8c-7.1 0-12.9-5.8-12.9-12.9S38.1 0 45.2 0s12.9 5.8 12.9 12.9v12.9H45.2zm0 6.5c7.1 0 12.9 5.8 12.9 12.9s-5.8 12.9-12.9 12.9H12.9C5.8 58.1 0 52.3 0 45.2s5.8-12.9 12.9-12.9h32.3z" fill="#36c5f0"/>
+      <path d="M97 45.2c0-7.1 5.8-12.9 12.9-12.9s12.9 5.8 12.9 12.9-5.8 12.9-12.9 12.9H97V45.2zm-6.5 0c0 7.1-5.8 12.9-12.9 12.9s-12.9-5.8-12.9-12.9V12.9C64.7 5.8 70.5 0 77.6 0s12.9 5.8 12.9 12.9v32.3z" fill="#2eb67d"/>
+      <path d="M77.6 97c7.1 0 12.9 5.8 12.9 12.9s-5.8 12.9-12.9 12.9-12.9-5.8-12.9-12.9V97h12.9zm0-6.5c-7.1 0-12.9-5.8-12.9-12.9s5.8-12.9 12.9-12.9h32.3c7.1 0 12.9 5.8 12.9 12.9s-5.8 12.9-12.9 12.9H77.6z" fill="#ecb22e"/>
+    </svg>
+    Add to Slack
+  </a>
+</section>
+
+<!-- FOOTER -->
+<footer>
+  <p>
+    Built by <a href="https://github.com/iamkingsleey" target="_blank" rel="noopener">Kingsley Mkpandiok</a> &nbsp;·&nbsp;
+    <a href="https://github.com/iamkingsleey/standup-agent" target="_blank" rel="noopener">Open Source on GitHub</a> &nbsp;·&nbsp;
+    <a href="privacy-policy.html">Privacy Policy</a>
+  </p>
+  <p style="margin-top:8px">&copy; 2026 Standup Agent · MIT License</p>
+</footer>
+
+</body>
+</html>
