@@ -1321,7 +1321,7 @@ def google_auth():
     if not creds_path:
         return "<h1>Error</h1><p>GOOGLE_CREDENTIALS_JSON environment variable not set in Railway.</p>", 500
 
-    base_url = os.environ.get("BASE_URL", "").rstrip("/")
+    base_url = os.environ.get("BASE_URL", "").strip().lstrip("=").rstrip("/")
     redirect_uri = f"{base_url}/auth/google/callback"
 
     flow = Flow.from_client_secrets_file(
@@ -1373,7 +1373,7 @@ def google_auth_callback():
         ), 400
 
     creds_path = load_google_credentials_file()
-    base_url = os.environ.get("BASE_URL", "").rstrip("/")
+    base_url = os.environ.get("BASE_URL", "").strip().lstrip("=").rstrip("/")
     redirect_uri = f"{base_url}/auth/google/callback"
 
     flow = Flow.from_client_secrets_file(
