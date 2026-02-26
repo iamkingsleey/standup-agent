@@ -970,8 +970,11 @@ def handle_message_event(event: dict, say) -> None:
         event (dict): The raw Slack event payload.
         say (callable): Slack Bolt's reply function, scoped to the event's channel.
     """
-    # Ignore messages sent by bots (including this bot itself)
-    if event.get('subtype') == 'bot_message':
+    # Ignore messages sent by bots (including this bot itself).
+    # Slack marks bot-generated messages with a 'bot_id' field — checking this
+    # is more reliable than checking 'subtype' alone, since Slack sometimes
+    # omits the bot_message subtype for DM responses.
+    if event.get('bot_id') or event.get('subtype') == 'bot_message':
         return
 
     # Ignore secondary event subtypes like message_changed, message_deleted, etc.
