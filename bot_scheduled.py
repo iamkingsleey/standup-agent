@@ -46,6 +46,7 @@ import requests as http_requests
 from flask import Flask, request, jsonify, redirect as flask_redirect
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
+from slack_bolt.authorization import AuthorizeResult
 from slack_sdk import WebClient
 from anthropic import Anthropic
 from dotenv import load_dotenv
@@ -81,7 +82,11 @@ def authorize(enterprise_id, team_id, logger):
     """
     token = get_installation_token(team_id)
     if token:
-        return {"bot_token": token}
+        return AuthorizeResult(
+            enterprise_id=enterprise_id,
+            team_id=team_id,
+            bot_token=token,
+        )
     raise Exception(f"No installation found for team {team_id}")
 
 
