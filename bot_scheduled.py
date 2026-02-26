@@ -84,7 +84,6 @@ app = App(
             "im:history",          # Read direct messages sent to the bot
             "im:write",            # Open and send DMs
             "users:read",          # Look up user presence and profile info
-            "search:read",         # Search Slack message history for context
         ],
         # FileInstallationStore saves each workspace's bot token as a JSON file
         # under data/installations/. Add a Railway Volume to persist across deploys.
