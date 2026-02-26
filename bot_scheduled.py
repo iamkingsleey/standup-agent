@@ -181,19 +181,20 @@ def get_my_jira_issues(assignee_email: str | None = None) -> str:
             "`JIRA_BASE_URL`, `JIRA_EMAIL`, and `JIRA_API_TOKEN` to Railway."
         )
 
+    # Determine assignee: use provided email, fall back to the service-account email
+    effective_email = assignee_email or JIRA_EMAIL
     jql = (
-        f'assignee = "{assignee_email}" AND resolution = Unresolved '
+        f'assignee = "{effective_email}" AND resolution = Unresolved '
         f'ORDER BY priority DESC, updated DESC'
-    ) if assignee_email else (
-        'assignee = currentUser() AND resolution = Unresolved ORDER BY priority DESC, updated DESC'
     )
 
     try:
-        resp = http_requests.get(
-            f"{JIRA_BASE_URL}/rest/api/3/search",
+        # Atlassian deprecated GET /rest/api/3/search — use the POST endpoint instead
+        resp = http_requests.post(
+            f"{JIRA_BASE_URL}/rest/api/3/issue/search",
             headers=jira_headers(),
-            params={"jql": jql, "maxResults": 10,
-                    "fields": "summary,status,priority,issuetype,project"},
+            json={"jql": jql, "maxResults": 10,
+                  "fields": ["summary", "status", "priority", "issuetype", "project"]},
             timeout=10,
         )
         resp.raise_for_status()
