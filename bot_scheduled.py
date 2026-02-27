@@ -2052,12 +2052,6 @@ def auto_respond_to_mention(
     if key not in pending_mentions:
         return
 
-    # Bail out if the owner is now showing as active on Slack
-    if check_user_active(owner_user_id, bot_token):
-        print(f"User is active, skipping auto-response for {key}")
-        del pending_mentions[key]
-        return
-
     # Bail out if the message contains sensitive/private keywords
     message_lower = original_message.lower()
     if any(keyword in message_lower for keyword in SENSITIVE_KEYWORDS):
